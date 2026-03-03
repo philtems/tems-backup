@@ -1,0 +1,157 @@
+[package]
+name = "tems-backup"
+version = "0.1.0"
+edition = "2021"
+authors = ["Philippe TEMESI <philippe@tems.be>"]
+description = "Advanced backup tool with deduplication and versioning"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tems-be/tems-backup"
+homepage = "https://www.tems.be"
+keywords = ["backup", "deduplication", "archive", "compression"]
+categories = ["command-line-utilities", "compression"]
+readme = "README.md"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true
+
+[dependencies]
+# CLI and user interaction
+clap = { version = "4.5", features = ["derive", "cargo", "wrap_help"] }
+anyhow = "1.0"
+thiserror = "1.0"
+dialoguer = "0.11"
+console = "0.15"
+indicatif = "0.17"
+
+# Database
+rusqlite = { version = "0.31", features = ["bundled", "trace", "blob", "series"] }
+
+# Compression (optional)
+zstd = { version = "0.13", optional = true }
+xz2 = { version = "0.1", optional = true }
+
+# Hashing (optional)
+blake3 = { version = "1.5", optional = true }
+xxhash-rust = { version = "0.8", features = ["xxh3"], optional = true }
+sha2 = { version = "0.10", optional = true }
+hex = "0.4"
+
+# Concurrency
+rayon = "1.8"
+tokio = { version = "1.36", features = ["rt", "macros"] }
+futures = "0.3"
+
+# File operations
+walkdir = "2"
+ignore = "0.4"
+filetime = "0.2"
+remove_dir_all = "0.8"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Path handling
+camino = { version = "1.1", features = ["serde1"] }
+path-clean = "1.0"
+
+# Cross-platform
+dirs = "5.0"
+whoami = "1.4"  # Remplace users pour être cross-platform
+normpath = "1.1"
+platform-info = "0.2"
+
+# Time and date
+chrono = "0.4"
+time = "0.3"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# System information
+sysinfo = "0.30"
+num_cpus = "1.16"
+
+# Regular expressions
+regex = "1.10"
+
+# UUID
+uuid = { version = "1.7", features = ["v4", "serde"] }
+
+# Progress formatting
+atty = "0.2"
+termcolor = "1.4"
+
+# Error handling
+derive_more = "0.99"
+
+# Build info
+rustc_version_runtime = "0.3"
+
+# Dépendances Unix uniquement
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.28", features = ["fs", "user"] }
+unix_mode = "0.1"
+# Note: users n'est plus utilisé, on utilise whoami à la place
+
+# Dépendances Windows uniquement
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = [
+    "fileapi", 
+    "winbase", 
+    "securitybaseapi", 
+    "accctrl", 
+    "winnt",
+    "synchapi",
+    "handleapi",
+    "errhandlingapi"
+] }
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_System_IO"
+] }
+
+[dev-dependencies]
+tempfile = "3.9"
+assert_cmd = "2.0"
+predicates = "3.1"
+rstest = "0.19"
+test-case = "3.3"
+
+[build-dependencies]
+rustc_version = "0.4"
+
+[features]
+default = ["zstd", "blake3"]
+
+# Compression features
+zstd = ["dep:zstd"]
+xz = ["dep:xz2"]
+
+# Hashing features
+blake3 = ["dep:blake3"]
+xxhash = ["dep:xxhash-rust"]
+sha256 = ["dep:sha2"]
+
+# All features
+full = ["zstd", "xz", "blake3", "xxhash", "sha256"]
+
+# Features spécifiques à la plateforme
+unix = []
+windows = []
+
+[badges]
+maintenance = { status = "actively-developed" }
+
+[[bin]]
+name = "tems-backup"
+path = "src/main.rs"
+
