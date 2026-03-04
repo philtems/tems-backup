@@ -11,8 +11,10 @@ use crate::core::file_scanner::FileInfo;
 use crate::storage::volume::{VolumeManager};
 use crate::commands::restore::RestoreOptions;
 use crate::utils::parse_date;
+use crate::utils::retry::{with_retry, RetryConfig};
 use std::collections::HashMap;
 use filetime::FileTime;
+use std::time::{UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -24,6 +26,12 @@ pub struct FileEntry {
     pub modified: u64,
     pub version: u64,
     pub deleted: bool,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum ProcessResult {
+    Processed,
+    Skipped,
 }
 
 pub struct Archive {
@@ -113,7 +121,7 @@ impl Archive {
     ) -> Result<()> {
         self.volume_manager.init_volumes(volume_size)?;
         for file in files {
-            self.process_file(file)?;
+            self.process_file(file, false, &RetryConfig::default())?;
         }
         Ok(())
     }
@@ -123,24 +131,71 @@ impl Archive {
         &mut self,
         files: &[FileInfo],
         volume_size: Option<u64>,
+        retry_config: &RetryConfig,
         mut progress_callback: F,
     ) -> Result<()> 
     where
-        F: FnMut(&str, u64),
+        F: FnMut(&str, u64, bool),
     {
         self.volume_manager.init_volumes(volume_size)?;
         for file in files {
-            progress_callback(
-                file.path.file_name().unwrap_or_default().to_str().unwrap_or("?"),
-                file.size
-            );
-            self.process_file(file)?;
+            let file_name = file.path.file_name().unwrap_or_default().to_str().unwrap_or("?");
+            let file_size = file.size;
+            
+            match self.process_file(file, false, retry_config) {
+                Ok(ProcessResult::Processed) | Ok(ProcessResult::Skipped) => {
+                    progress_callback(file_name, file_size, true);
+                }
+                Err(e) => {
+                    log::error!("Failed to process {}: {}", file.path.display(), e);
+                    progress_callback(file_name, file_size, false);
+                }
+            }
         }
         Ok(())
     }
 
-    /// Process single file
-    pub fn process_file(&mut self, file: &FileInfo) -> Result<()> {
+    /// Process single file with retry support
+    pub fn process_file(
+        &mut self,
+        file: &FileInfo,
+        newer_only: bool,
+        retry_config: &RetryConfig,
+    ) -> Result<ProcessResult> {
+        let path = file.path.clone();
+        
+        // Check if we should skip based on newer_only
+        if newer_only {
+            if let Some(last_modified) = self.get_last_modified(&path)? {
+                let file_modified = file.modified.duration_since(UNIX_EPOCH)
+                    .unwrap_or_default().as_secs() as i64;
+                
+                if file_modified <= last_modified {
+                    log::debug!("Skipping unchanged file: {}", path.display());
+                    return Ok(ProcessResult::Skipped);
+                }
+            }
+        }
+
+        // Process with retry
+        let result = with_retry(
+            || self.process_file_internal(file),
+            retry_config.max_retries,
+            retry_config.delay_seconds,
+            &format!("Processing file: {}", path.display()),
+        );
+
+        match result {
+            Ok(()) => Ok(ProcessResult::Processed),
+            Err(e) => {
+                log::error!("Failed to process {} after retries: {}", path.display(), e);
+                Err(e)
+            }
+        }
+    }
+
+    /// Internal file processing (no retry logic)
+    fn process_file_internal(&mut self, file: &FileInfo) -> Result<()> {
         let chunks = self.chunker.chunk_file(&file.path)?;
         let chunk_ids = self.process_chunks(chunks)?;
         let file_id = self.db.insert_file(file, self.get_next_version(&file.path)?)?;
@@ -152,6 +207,138 @@ impl Archive {
         self.db.link_chunks(file_id, &chunk_refs)?;
 
         Ok(())
+    }
+
+    /// Get last modified time for a file from database
+    fn get_last_modified(&self, path: &Path) -> Result<Option<i64>> {
+        let versions = self.db.get_file_history(path.to_str().unwrap())?;
+        Ok(versions.first().map(|(_, _, modified)| *modified))
+    }
+
+    /// Restore a single file with retry support
+    pub fn restore_file_with_retry(
+        &self,
+        file: &FileEntry,
+        target_dir: &Path,
+        options: &RestoreOptions,
+        retry_config: &RetryConfig,
+    ) -> Result<bool> {
+        if options.dry_run {
+            println!("Would restore: {}", file.path.display());
+            return Ok(true);
+        }
+
+        let result = with_retry(
+            || self.restore_file_internal(file, target_dir, options),
+            retry_config.max_retries,
+            retry_config.delay_seconds,
+            &format!("Restoring file: {}", file.path.display()),
+        );
+
+        match result {
+            Ok(restored) => Ok(restored),
+            Err(e) => {
+                log::error!("Failed to restore {} after retries: {}", file.path.display(), e);
+                Err(e)
+            }
+        }
+    }
+
+    /// Internal file restoration (no retry logic)
+    fn restore_file_internal(
+        &self,
+        file: &FileEntry,
+        target_dir: &Path,
+        options: &RestoreOptions,
+    ) -> Result<bool> {
+        let target_path = self.build_target_path(file, target_dir, options)?;
+
+        if !options.should_overwrite(&target_path)? {
+            println!("Skipping existing file: {}", target_path.display());
+            return Ok(false);
+        }
+
+        if options.backup_existing && target_path.exists() {
+            let backup = target_path.with_extension("bak");
+            std::fs::rename(&target_path, &backup)?;
+            println!("Backed up existing file to: {}", backup.display());
+        }
+
+        if let Some(parent) = target_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let chunks = self.get_file_chunks(file)?;
+
+        let mut output = File::create(&target_path)?;
+        
+        for chunk_info in chunks {
+            let data = self.read_chunk(&chunk_info)?;
+            output.write_all(&data)?;
+        }
+
+        // Preserve metadata
+        if options.preserve_times {
+            let atime = FileTime::now();
+            let mtime = FileTime::from_unix_time(file.modified as i64, 0);
+            filetime::set_file_times(&target_path, atime, mtime)?;
+        }
+
+        #[cfg(unix)]
+        {
+            if options.preserve_permissions {
+                if let Some(perms) = self.get_file_permissions(file)? {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&target_path, std::fs::Permissions::from_mode(perms))?;
+                }
+            }
+
+            if options.preserve_ownership {
+                if let (Some(uid), Some(gid)) = (self.get_file_uid(file)?, self.get_file_gid(file)?) {
+                    let _ = nix::unistd::chown(&target_path, Some(uid.into()), Some(gid.into()))?;
+                }
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Build target path for restored file
+    fn build_target_path(
+        &self,
+        file: &FileEntry,
+        target_dir: &Path,
+        options: &RestoreOptions,
+    ) -> Result<PathBuf> {
+        if options.flatten {
+            return Ok(target_dir.join(file.path.file_name().unwrap_or_default()));
+        }
+
+        if let Some(strip) = options.strip_components {
+            let components: Vec<_> = file.path.components().skip(strip).collect();
+            if components.is_empty() {
+                return Ok(target_dir.join(file.path.file_name().unwrap_or_default()));
+            }
+            return Ok(target_dir.join(components.iter().collect::<PathBuf>()));
+        }
+
+        let mut full_path = target_dir.to_path_buf();
+        for component in file.path.components() {
+            match component {
+                std::path::Component::RootDir => continue,
+                std::path::Component::CurDir => continue,
+                std::path::Component::ParentDir => {
+                    full_path.pop();
+                }
+                std::path::Component::Normal(part) => {
+                    full_path.push(part);
+                }
+                _ => {
+                    full_path.push(component.as_os_str());
+                }
+            }
+        }
+        Ok(full_path)
     }
 
     /// Process chunks (deduplication) and return chunk IDs
@@ -354,86 +541,7 @@ impl Archive {
 
     /// Restore a single file (public version)
     pub fn restore_file_public(&self, file: &FileEntry, target_dir: &Path, options: &RestoreOptions) -> Result<()> {
-        let target_path = if options.flatten {
-            target_dir.join(file.path.file_name().unwrap_or_default())
-        } else if let Some(strip) = options.strip_components {
-            let components: Vec<_> = file.path.components().skip(strip).collect();
-            if components.is_empty() {
-                target_dir.join(file.path.file_name().unwrap_or_default())
-            } else {
-                target_dir.join(components.iter().collect::<PathBuf>())
-            }
-        } else {
-            let mut full_path = target_dir.to_path_buf();
-            
-            for component in file.path.components() {
-                match component {
-                    std::path::Component::RootDir => continue,
-                    std::path::Component::CurDir => continue,
-                    std::path::Component::ParentDir => {
-                        full_path.pop();
-                    }
-                    std::path::Component::Normal(part) => {
-                        full_path.push(part);
-                    }
-                    _ => {
-                        full_path.push(component.as_os_str());
-                    }
-                }
-            }
-            full_path
-        };
-
-        if options.dry_run {
-            println!("Would restore: {} -> {}", file.path.display(), target_path.display());
-            return Ok(());
-        }
-
-        if !options.should_overwrite(&target_path)? {
-            println!("Skipping existing file: {}", target_path.display());
-            return Ok(());
-        }
-
-        if options.backup_existing && target_path.exists() {
-            let backup = target_path.with_extension("bak");
-            std::fs::rename(&target_path, &backup)?;
-            println!("Backed up existing file to: {}", backup.display());
-        }
-
-        if let Some(parent) = target_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let chunks = self.get_file_chunks(file)?;
-
-        let mut output = File::create(&target_path)?;
-        
-        for chunk_info in chunks {
-            let data = self.read_chunk(&chunk_info)?;
-            output.write_all(&data)?;
-        }
-
-        if options.preserve_times {
-            let atime = FileTime::now();
-            let mtime = FileTime::from_unix_time(file.modified as i64, 0);
-            filetime::set_file_times(&target_path, atime, mtime)?;
-        }
-
-        #[cfg(unix)]
-        if options.preserve_permissions {
-            if let Some(perms) = self.get_file_permissions(file)? {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&target_path, std::fs::Permissions::from_mode(perms))?;
-            }
-        }
-
-        #[cfg(unix)]
-        if options.preserve_ownership {
-            if let (Some(uid), Some(gid)) = (self.get_file_uid(file)?, self.get_file_gid(file)?) {
-                let _ = nix::unistd::chown(&target_path, Some(uid.into()), Some(gid.into()))?;
-            }
-        }
-
+        self.restore_file_internal(file, target_dir, options)?;
         Ok(())
     }
 

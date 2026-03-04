@@ -4,6 +4,7 @@ pub mod progress;
 pub mod platform;
 pub mod config;
 pub mod logging;
+pub mod retry;
 
 use anyhow::Result;
 

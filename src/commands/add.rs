@@ -13,10 +13,13 @@ use crate::core::compression::CompressionAlgorithm;
 use crate::core::hash::HashAlgorithm;
 use crate::utils::progress::ProgressBar;
 use crate::utils::parse_duration;
+use crate::utils::retry::RetryConfig;
+use crate::core::archive::ProcessResult;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::SystemTime;
+use std::time::Instant;
 
 #[derive(Args)]
 pub struct AddArgs {
@@ -67,6 +70,18 @@ pub struct AddArgs {
     /// Only include files modified within this duration (e.g., 1d, 12h, 30m)
     #[arg(long)]
     pub max_age: Option<String>,
+
+    /// Only add files that are newer than the version in the archive
+    #[arg(long)]
+    pub newer_only: bool,
+
+    /// Number of retry attempts for failed files (-1 = infinite, 0 = no retry)
+    #[arg(long, default_value_t = 0)]
+    pub retry: i32,
+
+    /// Delay between retries in seconds
+    #[arg(long, default_value_t = 5)]
+    pub retry_delay: u64,
 }
 
 pub fn execute(args: AddArgs, config: &Config) -> Result<()> {
@@ -110,6 +125,12 @@ pub fn execute(args: AddArgs, config: &Config) -> Result<()> {
         None
     };
 
+    // Create retry configuration
+    let retry_config = RetryConfig {
+        max_retries: args.retry,
+        delay_seconds: args.retry_delay,
+    };
+
     // Scan files
     let mut scanner = FileScanner::new(
         if args.exclude.is_empty() { config.exclude.patterns.clone() } else { args.exclude },
@@ -139,7 +160,17 @@ pub fn execute(args: AddArgs, config: &Config) -> Result<()> {
         return Ok(());
     }
 
-    // IMPORTANT: Open archive WITH existing volumes loaded
+    // Show summary
+    if args.newer_only {
+        println!("Mode: newer-only (skipping unchanged files)");
+    }
+    if args.retry != 0 {
+        println!("Retry: {} attempts, {}s delay", 
+            if args.retry == -1 { "infinite".to_string() } else { args.retry.to_string() },
+            args.retry_delay);
+    }
+
+    // Open archive WITH existing volumes loaded
     let mut archive = Archive::open_with_config(
         args.archive.clone(),
         db,
@@ -150,23 +181,54 @@ pub fn execute(args: AddArgs, config: &Config) -> Result<()> {
 
     // Progress bar
     let progress_bar = if args.progress {
-        Some(ProgressBar::new_backup_bar(files.len() as u64, total_size))
+        Some(ProgressBar::new_dual_backup_bar(files.len() as u64, total_size))
     } else {
         None
     };
 
     let processed_files = Arc::new(AtomicU64::new(0));
+    let processed_bytes = Arc::new(AtomicU64::new(0));
+    let failed_files = Arc::new(AtomicUsize::new(0));
+    let skipped_files = Arc::new(AtomicUsize::new(0));
+    let start_time = Arc::new(Instant::now());
     let progress_bar_ref = progress_bar.as_ref();
 
     // Add files with progress
     for file in &files {
         if let Some(pb) = progress_bar_ref {
-            let current = processed_files.fetch_add(1, Ordering::Relaxed) + 1;
-            pb.set_message(format!("Adding: {}", file.path.display()));
-            pb.set_position(current);
+            let current_files = processed_files.fetch_add(1, Ordering::Relaxed) + 1;
+            
+            // Calculate files per second
+            let elapsed = start_time.elapsed().as_secs_f64();
+            let files_per_sec = if elapsed > 0.0 {
+                current_files as f64 / elapsed
+            } else {
+                0.0
+            };
+            
+            pb.set_files_message(format!("Adding: {}", file.path.display()));
+            pb.set_files_speed(files_per_sec);
+            pb.set_position(current_files);
         }
         
-        archive.process_file(file)?;
+        match archive.process_file(file, args.newer_only, &retry_config) {
+            Ok(ProcessResult::Processed) => {
+                // File was processed
+                processed_bytes.fetch_add(file.size, Ordering::Relaxed);
+                if let Some(pb) = progress_bar_ref {
+                    pb.set_data_position(processed_bytes.load(Ordering::Relaxed));
+                }
+            }
+            Ok(ProcessResult::Skipped) => {
+                // File was skipped (newer_only)
+                skipped_files.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                // File failed after retries
+                eprintln!("Failed to add {}: {}", file.path.display(), e);
+                failed_files.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     if let Some(pb) = progress_bar {
@@ -175,8 +237,17 @@ pub fn execute(args: AddArgs, config: &Config) -> Result<()> {
 
     // Show stats
     let stats = archive.get_stats()?;
+    let failed = failed_files.load(Ordering::Relaxed);
+    let skipped = skipped_files.load(Ordering::Relaxed);
+    
     println!("\nAddition completed successfully!");
-    println!("Files added: {}", files.len());
+    if skipped > 0 {
+        println!("⏭️  {} files skipped (unchanged)", skipped);
+    }
+    if failed > 0 {
+        println!("⚠️  {} files failed and were not added", failed);
+    }
+    println!("Files added: {}", files.len() - skipped - failed);
     println!("Total files in archive: {}", stats.get("files").unwrap_or(&"0".to_string()));
     println!("Total size: {}", format_size(stats.get("total_size").unwrap_or(&"0".to_string()).parse().unwrap_or(0)));
 

@@ -12,10 +12,12 @@ use crate::core::compression::CompressionAlgorithm;
 use crate::core::hash::HashAlgorithm;
 use crate::utils::progress::ProgressBar;
 use crate::utils::parse_duration;
+use crate::utils::retry::RetryConfig;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::SystemTime;
+use std::time::Instant;
 
 #[derive(Args)]
 pub struct CreateArgs {
@@ -78,6 +80,14 @@ pub struct CreateArgs {
     /// Only include files modified within this duration (e.g., 1d, 12h, 30m)
     #[arg(long)]
     pub max_age: Option<String>,
+
+    /// Number of retry attempts for failed files (-1 = infinite, 0 = no retry)
+    #[arg(long, default_value_t = 0)]
+    pub retry: i32,
+
+    /// Delay between retries in seconds
+    #[arg(long, default_value_t = 5)]
+    pub retry_delay: u64,
 }
 
 pub fn execute(args: CreateArgs, config: &Config) -> Result<()> {
@@ -131,6 +141,12 @@ pub fn execute(args: CreateArgs, config: &Config) -> Result<()> {
         None
     };
 
+    // Create retry configuration
+    let retry_config = RetryConfig {
+        max_retries: args.retry,
+        delay_seconds: args.retry_delay,
+    };
+
     // Show summary
     println!("Configuration:");
     println!("  Chunk size: {}", format_size(chunk_size as u64));
@@ -143,6 +159,11 @@ pub fn execute(args: CreateArgs, config: &Config) -> Result<()> {
     println!("  Threads: {}", threads);
     if let Some(age) = max_age_seconds {
         println!("  Max age: {} seconds", age);
+    }
+    if args.retry != 0 {
+        println!("  Retry: {} attempts, {}s delay", 
+            if args.retry == -1 { "infinite".to_string() } else { args.retry.to_string() },
+            args.retry_delay);
     }
     println!();
 
@@ -170,23 +191,44 @@ pub fn execute(args: CreateArgs, config: &Config) -> Result<()> {
 
     // Create progress bar if requested
     let progress_bar = if args.progress {
-        Some(ProgressBar::new_backup_bar(files.len() as u64, total_size))
+        Some(ProgressBar::new_dual_backup_bar(files.len() as u64, total_size))
     } else {
         None
     };
 
     let processed_files = Arc::new(AtomicU64::new(0));
+    let processed_bytes = Arc::new(AtomicU64::new(0));
+    let failed_files = Arc::new(AtomicUsize::new(0));
+    let start_time = Arc::new(Instant::now());
     let progress_bar_ref = progress_bar.as_ref();
 
     // Use create_with_progress instead of create
     archive.create_with_progress(
         &files,
         volume_size,
-        |file_name: &str, _file_size: u64| {
+        &retry_config,
+        |file_name: &str, file_size: u64, success: bool| {
             if let Some(pb) = progress_bar_ref {
-                let current = processed_files.fetch_add(1, Ordering::Relaxed) + 1;
-                pb.set_message(format!("File: {}", file_name));
-                pb.set_position(current);
+                let current_files = processed_files.fetch_add(1, Ordering::Relaxed) + 1;
+                let current_bytes = processed_bytes.fetch_add(file_size, Ordering::Relaxed) + file_size;
+                
+                if !success {
+                    failed_files.fetch_add(1, Ordering::Relaxed);
+                }
+                
+                // Calculate files per second
+                let elapsed = start_time.elapsed().as_secs_f64();
+                let files_per_sec = if elapsed > 0.0 {
+                    current_files as f64 / elapsed
+                } else {
+                    0.0
+                };
+                
+                // Update progress bars
+                pb.set_files_message(format!("File: {}", file_name));
+                pb.set_files_speed(files_per_sec);
+                pb.set_position(current_files);
+                pb.set_data_position(current_bytes);
             }
         }
     )?;
@@ -197,7 +239,12 @@ pub fn execute(args: CreateArgs, config: &Config) -> Result<()> {
 
     // Show stats
     let stats = archive.get_stats()?;
+    let failed = failed_files.load(Ordering::Relaxed);
+    
     println!("\nBackup completed successfully!");
+    if failed > 0 {
+        println!("⚠️  {} files failed and were skipped", failed);
+    }
     println!("Summary:");
     println!("  Files backed up: {}", stats.get("files").unwrap_or(&"0".to_string()));
     println!("  Unique chunks: {}", stats.get("chunks").unwrap_or(&"0".to_string()));
