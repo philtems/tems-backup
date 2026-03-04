@@ -114,7 +114,6 @@ winapi = { version = "0.3", features = [
     "errhandlingapi"
 ] }
 windows-sys = "0.52"
-regex = "1.10"  # Déjà en dépendance principale, mais on le met pour Windows aussi
 
 [dev-dependencies]
 tempfile = "3.9"

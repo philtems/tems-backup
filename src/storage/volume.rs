@@ -56,8 +56,15 @@ impl VolumeManager {
     pub fn init_volumes(&mut self, volume_size: Option<u64>) -> Result<()> {
         std::fs::create_dir_all(&self.volumes_dir)?;
 
-        if let Some(size) = volume_size {
-            self.create_new_volume(size)?;
+        // Si aucun volume n'existe, en créer un par défaut
+        if self.volumes.is_empty() {
+            let default_size = volume_size.unwrap_or(1024 * 1024 * 1024); // 1GB par défaut
+            self.create_new_volume(default_size)?;
+        } else if let Some(size) = volume_size {
+            // Si un volume_size est spécifié et qu'il n'y a pas de volume actif, en créer un
+            if self.current_volume.is_none() {
+                self.create_new_volume(size)?;
+            }
         }
 
         Ok(())
@@ -90,6 +97,7 @@ impl VolumeManager {
     }
 
     pub fn find_volume_with_space(&mut self, needed: u64) -> Result<(u64, PathBuf, u64)> {
+        // Vérifier d'abord si on a un volume actif avec assez d'espace
         if let Some(num) = self.current_volume {
             if let Some(vol) = self.volumes.get(&num) {
                 if vol.free_space >= needed && vol.status == VolumeStatus::Active {
@@ -98,6 +106,7 @@ impl VolumeManager {
             }
         }
 
+        // Chercher dans tous les volumes
         for vol in self.volumes.values() {
             if vol.free_space >= needed && vol.status == VolumeStatus::Active {
                 self.current_volume = Some(vol.number);
@@ -105,10 +114,8 @@ impl VolumeManager {
             }
         }
 
-        if self.volumes.is_empty() {
-            return Err(TemsError::InvalidVolumeSize("No volumes exist in archive".into()).into());
-        }
-
+        // Si aucun volume n'a assez d'espace, en créer un nouveau
+        // Déterminer la taille du nouveau volume
         let max_size = if let Some(db) = &self.db {
             let conn = db.conn.lock().unwrap();
             let size: Option<i64> = conn.query_row(
@@ -128,12 +135,9 @@ impl VolumeManager {
             }
         }
 
-        let max_size = self.volumes.values()
-            .filter_map(|v| v.max_size)
-            .max()
-            .ok_or_else(|| TemsError::InvalidVolumeSize("Cannot determine volume size for new volume".into()))?;
-
-        let new_vol = self.create_new_volume(max_size)?;
+        // Si on ne peut pas déterminer la taille, utiliser 1GB par défaut
+        let default_size = 1024 * 1024 * 1024; // 1GB
+        let new_vol = self.create_new_volume(default_size)?;
         Ok((new_vol.number, new_vol.path, new_vol.free_space))
     }
 

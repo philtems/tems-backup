@@ -12,7 +12,6 @@
 //! - **SQLite index**: Fast and reliable metadata storage
 //! - **Integrity checking**: Verify archive integrity
 //! - **Garbage collection**: Remove orphaned chunks
-//! - **VSS support**: Volume Shadow Copy for open files on Windows
 //!
 //! ## Example
 //!

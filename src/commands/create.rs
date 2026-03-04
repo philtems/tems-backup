@@ -1,8 +1,8 @@
 //! Create command implementation
 
 use clap::Args;
-use std::path::{Path, PathBuf};
-use anyhow::{Result, anyhow};
+use std::path::PathBuf;
+use anyhow::Result;
 use crate::utils::config::Config;
 use crate::core::archive::Archive;
 use crate::storage::database::Database;
@@ -13,194 +13,11 @@ use crate::core::hash::HashAlgorithm;
 use crate::utils::progress::ProgressBar;
 use crate::utils::parse_duration;
 use crate::utils::retry::RetryConfig;
-use crate::core::archive::ProcessResult;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::SystemTime;
 use std::time::Instant;
-use log::{debug, info, warn};
-use std::collections::HashMap;
-use std::sync::{Arc as SyncArc, Mutex};
-use std::process::Command;
-
-// VSS implementation
-#[cfg(windows)]
-struct VolumeSnapshot {
-    volume: String,
-    shadow_id: String,
-    device_path: String,
-}
-
-#[cfg(windows)]
-struct VssManager {
-    snapshots: SyncArc<Mutex<HashMap<String, VolumeSnapshot>>>,
-    initialized: bool,
-}
-
-#[cfg(windows)]
-impl VssManager {
-    fn new() -> Self {
-        Self {
-            snapshots: SyncArc::new(Mutex::new(HashMap::new())),
-            initialized: false,
-        }
-    }
-
-    fn check_admin() -> bool {
-        match Command::new("vssadmin").arg("list").output() {
-            Ok(output) => output.status.success(),
-            Err(_) => false,
-        }
-    }
-
-    fn initialize(&mut self) -> Result<()> {
-        if !Self::check_admin() {
-            return Err(anyhow!("VSS requires administrator privileges"));
-        }
-        self.initialized = true;
-        info!("VSS Manager initialized");
-        Ok(())
-    }
-
-    fn get_volume_root(path: &Path) -> Result<String> {
-        let path_str = path.to_string_lossy();
-        if path_str.len() >= 2 && path_str.as_bytes()[1] == b':' {
-            Ok(format!("{}:", &path_str[0..2]))
-        } else {
-            Err(anyhow!("Could not determine volume from path: {}", path_str))
-        }
-    }
-
-    fn collect_volumes(&self, paths: &[&Path]) -> Vec<String> {
-        let mut volumes = Vec::new();
-        for path in paths {
-            if let Ok(volume) = Self::get_volume_root(path) {
-                if !volumes.contains(&volume) {
-                    volumes.push(volume);
-                }
-            }
-        }
-        volumes
-    }
-
-    fn create_snapshot_for_volume(&self, volume: &str) -> Result<VolumeSnapshot> {
-        info!("Creating VSS snapshot for volume {}", volume);
-        
-        let output = Command::new("vssadmin")
-            .args(&["create", "shadow", "/for", volume])
-            .output()
-            .map_err(|e| anyhow!("Failed to execute vssadmin: {}", e))?;
-        
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!("vssadmin failed: {}", stderr));
-        }
-        
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stdout_str = stdout.to_string();
-        
-        let shadow_id = stdout_str
-            .lines()
-            .find(|line| line.contains("Shadow Copy ID:"))
-            .and_then(|line| {
-                line.split(':').nth(1).map(|s| s.trim().to_string())
-            })
-            .ok_or_else(|| anyhow!("Could not find Shadow Copy ID"))?;
-        
-        let device_path = stdout_str
-            .lines()
-            .find(|line| line.contains("Shadow Copy Volume:"))
-            .and_then(|line| {
-                line.split(':').nth(1).map(|s| s.trim().to_string())
-            })
-            .ok_or_else(|| anyhow!("Could not find Shadow Copy Volume"))?;
-        
-        Ok(VolumeSnapshot {
-            volume: volume.to_string(),
-            shadow_id,
-            device_path,
-        })
-    }
-
-    fn create_snapshots(&mut self, paths: &[&Path]) -> Result<()> {
-        if !self.initialized {
-            return Err(anyhow!("VSS Manager not initialized"));
-        }
-
-        let volumes = self.collect_volumes(paths);
-        for volume in volumes {
-            let mut snapshots = self.snapshots.lock().unwrap();
-            if !snapshots.contains_key(&volume) {
-                match self.create_snapshot_for_volume(&volume) {
-                    Ok(snapshot) => {
-                        snapshots.insert(volume.clone(), snapshot);
-                        info!("✅ Created snapshot for volume {}", volume);
-                    }
-                    Err(e) => {
-                        eprintln!("⚠️  Failed to create snapshot for volume {}: {}", volume, e);
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn translate_path(&self, original_path: &Path) -> Result<PathBuf> {
-        let volume = Self::get_volume_root(original_path)?;
-        let snapshots = self.snapshots.lock().unwrap();
-        let snapshot = snapshots.get(&volume)
-            .ok_or_else(|| anyhow!("No snapshot found for volume {}", volume))?;
-        
-        let original_str = original_path.to_string_lossy();
-        let relative_path = &original_str[volume.len()..];
-        let relative_path = relative_path.trim_start_matches('\\');
-        
-        Ok(Path::new(&snapshot.device_path).join(relative_path))
-    }
-
-    fn has_snapshot(&self, path: &Path) -> bool {
-        if let Ok(volume) = Self::get_volume_root(path) {
-            let snapshots = self.snapshots.lock().unwrap();
-            snapshots.contains_key(&volume)
-        } else {
-            false
-        }
-    }
-
-    fn snapshot_count(&self) -> usize {
-        let snapshots = self.snapshots.lock().unwrap();
-        snapshots.len()
-    }
-}
-
-#[cfg(windows)]
-impl Drop for VssManager {
-    fn drop(&mut self) {
-        let snapshots = self.snapshots.lock().unwrap();
-        for (_, snapshot) in snapshots.iter() {
-            let _ = Command::new("vssadmin")
-                .args(&["delete", "shadows", "/shadow", &snapshot.shadow_id, "/quiet"])
-                .output();
-        }
-        info!("VSS Manager cleaned up");
-    }
-}
-
-// Stub pour non-Windows
-#[cfg(not(windows))]
-struct VssManager;
-
-#[cfg(not(windows))]
-impl VssManager {
-    fn new() -> Self { Self }
-    fn check_admin() -> bool { true }
-    fn initialize(&mut self) -> Result<()> { Ok(()) }
-    fn create_snapshots(&mut self, _paths: &[&Path]) -> Result<()> { Ok(()) }
-    fn translate_path(&self, path: &Path) -> Result<PathBuf> { Ok(path.to_path_buf()) }
-    fn has_snapshot(&self, _path: &Path) -> bool { false }
-    fn snapshot_count(&self) -> usize { 0 }
-}
 
 #[derive(Args)]
 pub struct CreateArgs {
@@ -271,10 +88,6 @@ pub struct CreateArgs {
     /// Delay between retries in seconds
     #[arg(long, default_value_t = 5)]
     pub retry_delay: u64,
-
-    /// Use VSS (Volume Shadow Copy) on Windows to backup open files
-    #[arg(long)]
-    pub use_vss: bool,
 }
 
 pub fn execute(args: CreateArgs, config: &Config) -> Result<()> {
@@ -334,27 +147,6 @@ pub fn execute(args: CreateArgs, config: &Config) -> Result<()> {
         delay_seconds: args.retry_delay,
     };
 
-    // Initialize VSS if requested
-    let mut vss_manager = if args.use_vss {
-        if !VssManager::check_admin() {
-            return Err(anyhow::anyhow!(
-                "VSS requires administrator privileges. Please run as administrator."
-            ));
-        }
-        let mut manager = VssManager::new();
-        match manager.initialize() {
-            Ok(()) => {
-                println!("✅ VSS Manager initialized");
-                Some(manager)
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!("VSS initialization failed: {}", e));
-            }
-        }
-    } else {
-        None
-    };
-
     // Show summary
     println!("Configuration:");
     println!("  Chunk size: {}", format_size(chunk_size as u64));
@@ -372,9 +164,6 @@ pub fn execute(args: CreateArgs, config: &Config) -> Result<()> {
         println!("  Retry: {} attempts, {}s delay", 
             if args.retry == -1 { "infinite".to_string() } else { args.retry.to_string() },
             args.retry_delay);
-    }
-    if args.use_vss {
-        println!("  VSS: enabled");
     }
     println!();
 
@@ -400,20 +189,6 @@ pub fn execute(args: CreateArgs, config: &Config) -> Result<()> {
         return Ok(());
     }
 
-    // Create VSS snapshots for all volumes needed
-    if let Some(ref mut vss) = vss_manager {
-        let path_refs: Vec<&Path> = files.iter().map(|f| f.path.as_path()).collect();
-        match vss.create_snapshots(&path_refs) {
-            Ok(()) => {
-                println!("✅ Created {} VSS snapshots", vss.snapshot_count());
-            }
-            Err(e) => {
-                eprintln!("⚠️  Warning: Failed to create some VSS snapshots: {}", e);
-                println!("Continuing without VSS for affected volumes");
-            }
-        }
-    }
-
     // Create progress bar if requested
     let progress_bar = if args.progress {
         Some(ProgressBar::new_dual_backup_bar(files.len() as u64, total_size))
@@ -427,61 +202,36 @@ pub fn execute(args: CreateArgs, config: &Config) -> Result<()> {
     let start_time = Arc::new(Instant::now());
     let progress_bar_ref = progress_bar.as_ref();
 
-    // Process files
-    for file in &files {
-        if let Some(pb) = progress_bar_ref {
-            let current_files = processed_files.fetch_add(1, Ordering::Relaxed) + 1;
-            
-            // Calculate files per second
-            let elapsed = start_time.elapsed().as_secs_f64();
-            let files_per_sec = if elapsed > 0.0 {
-                current_files as f64 / elapsed
-            } else {
-                0.0
-            };
-            
-            pb.set_files_message(format!("File: {}", file.path.display()));
-            pb.set_files_speed(files_per_sec);
-            pb.set_position(current_files);
-        }
-
-        // Determine which path to use (original or VSS snapshot)
-        let file_path = if let Some(ref vss) = vss_manager {
-            if vss.has_snapshot(&file.path) {
-                match vss.translate_path(&file.path) {
-                    Ok(snapshot_path) => {
-                        debug!("Using VSS snapshot path: {}", snapshot_path.display());
-                        snapshot_path
-                    }
-                    Err(_) => file.path.clone()
+    // Use create_with_progress instead of create
+    archive.create_with_progress(
+        &files,
+        volume_size,
+        &retry_config,
+        |file_name: &str, file_size: u64, success: bool| {
+            if let Some(pb) = progress_bar_ref {
+                let current_files = processed_files.fetch_add(1, Ordering::Relaxed) + 1;
+                let current_bytes = processed_bytes.fetch_add(file_size, Ordering::Relaxed) + file_size;
+                
+                if !success {
+                    failed_files.fetch_add(1, Ordering::Relaxed);
                 }
-            } else {
-                file.path.clone()
-            }
-        } else {
-            file.path.clone()
-        };
-
-        // Create a temporary FileInfo with the correct path
-        let mut file_info = file.clone();
-        file_info.path = file_path;
-
-        match archive.process_file(&file_info, false, &retry_config) {
-            Ok(ProcessResult::Processed) => {
-                processed_bytes.fetch_add(file.size, Ordering::Relaxed);
-                if let Some(pb) = progress_bar_ref {
-                    pb.set_data_position(processed_bytes.load(Ordering::Relaxed));
-                }
-            }
-            Ok(ProcessResult::Skipped) => {
-                // Should not happen with newer_only=false
-            }
-            Err(e) => {
-                eprintln!("Failed to process {}: {}", file.path.display(), e);
-                failed_files.fetch_add(1, Ordering::Relaxed);
+                
+                // Calculate files per second
+                let elapsed = start_time.elapsed().as_secs_f64();
+                let files_per_sec = if elapsed > 0.0 {
+                    current_files as f64 / elapsed
+                } else {
+                    0.0
+                };
+                
+                // Update progress bars
+                pb.set_files_message(format!("File: {}", file_name));
+                pb.set_files_speed(files_per_sec);
+                pb.set_position(current_files);
+                pb.set_data_position(current_bytes);
             }
         }
-    }
+    )?;
 
     if let Some(pb) = progress_bar {
         pb.finish();
