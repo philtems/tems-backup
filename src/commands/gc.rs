@@ -107,7 +107,7 @@ pub fn execute(args: GcArgs, _config: &crate::utils::config::Config) -> Result<(
     }
 
     // Process each volume
-    let total_volumes = by_volume.len();
+    let _total_volumes = by_volume.len();
     let mut processed = 0;
 
     for (volume_num, chunks) in by_volume {

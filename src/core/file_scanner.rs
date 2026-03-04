@@ -26,7 +26,7 @@ pub struct FileScanner {
     exclude_caches: bool,
     follow_symlinks: bool,
     max_depth: Option<usize>,
-    hidden: bool,  // Control inclusion of hidden files
+    hidden: bool,
 }
 
 impl FileScanner {
@@ -41,16 +41,14 @@ impl FileScanner {
             exclude_caches,
             follow_symlinks: false,
             max_depth: None,
-            hidden: true,  // By default, include hidden files
+            hidden: true,
         }
     }
 
-    /// Set whether to include hidden files
     pub fn set_hidden(&mut self, hidden: bool) {
         self.hidden = hidden;
     }
 
-    /// Scan multiple paths
     pub fn scan_paths(&self, paths: &[PathBuf]) -> Result<Vec<FileInfo>> {
         let results: Vec<Result<Vec<FileInfo>>> = paths.par_iter()
             .map(|path| self.scan_single_path(path))
@@ -64,34 +62,30 @@ impl FileScanner {
         Ok(all_files)
     }
 
-    /// Scan single path
     fn scan_single_path(&self, path: &Path) -> Result<Vec<FileInfo>> {
         if !path.exists() {
             return Err(anyhow::anyhow!("Path not found: {}", path.display()));
         }
 
         if path.is_file() {
-            // Single file
             Ok(vec![self.scan_file(path)?])
         } else {
-            // Directory tree
             self.scan_directory(path)
         }
     }
 
-    /// Scan directory recursively
     fn scan_directory(&self, path: &Path) -> Result<Vec<FileInfo>> {
         let mut files = Vec::new();
         let mut walker = WalkBuilder::new(path);
         walker
             .follow_links(self.follow_symlinks)
             .max_depth(self.max_depth)
-            .hidden(!self.hidden)  // IMPORTANT: Don't ignore hidden files if hidden = true
-            .ignore(false)          // Don't use .gitignore
-            .git_ignore(false)      // Don't ignore git files
-            .git_global(false)      // Don't use global git rules
-            .git_exclude(false)     // Don't use .git/info/exclude
-            .parents(false);        // Don't look for ignore files in parents
+            .hidden(!self.hidden)
+            .ignore(false)
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .parents(false);
 
         if self.exclude_caches {
             walker.filter_entry(|entry| {
@@ -120,7 +114,6 @@ impl FileScanner {
         Ok(files)
     }
 
-    /// Scan single file
     fn scan_file(&self, path: &Path) -> Result<FileInfo> {
         let metadata = std::fs::symlink_metadata(path)?;
         
@@ -135,18 +128,15 @@ impl FileScanner {
         })
     }
 
-    /// Check if file should be included based on patterns
     fn should_include(&self, path: &Path) -> bool {
         let path_str = path.to_string_lossy();
 
-        // First check excludes
         for pattern in &self.exclude_patterns {
             if self.matches_pattern(&path_str, pattern) {
                 return false;
             }
         }
 
-        // If include patterns specified, at least one must match
         if !self.include_patterns.is_empty() {
             for pattern in &self.include_patterns {
                 if self.matches_pattern(&path_str, pattern) {
@@ -156,13 +146,10 @@ impl FileScanner {
             return false;
         }
 
-        // No include patterns means include all
         true
     }
 
-    /// Simple glob pattern matching
     fn matches_pattern(&self, path: &str, pattern: &str) -> bool {
-        // Convert glob pattern to regex (simplified)
         let regex = pattern
             .replace(".", "\\.")
             .replace("*", ".*")
@@ -175,40 +162,34 @@ impl FileScanner {
         }
     }
 
-    /// Get file permissions (cross-platform)
+    #[cfg(unix)]
     fn get_permissions(&self, metadata: &std::fs::Metadata) -> Option<u32> {
-        #[cfg(unix)]
-        {
-            Some(metadata.permissions().mode())
-        }
-        #[cfg(not(unix))]
-        {
-            None
-        }
+        Some(metadata.permissions().mode())
     }
 
-    /// Get file owner (Unix only)
+    #[cfg(not(unix))]
+    fn get_permissions(&self, _metadata: &std::fs::Metadata) -> Option<u32> {
+        None
+    }
+
+    #[cfg(unix)]
     fn get_uid(&self, metadata: &std::fs::Metadata) -> Option<u32> {
-        #[cfg(unix)]
-        {
-            Some(metadata.uid())
-        }
-        #[cfg(not(unix))]
-        {
-            None
-        }
+        Some(metadata.uid())
     }
 
-    /// Get file group (Unix only)
+    #[cfg(not(unix))]
+    fn get_uid(&self, _metadata: &std::fs::Metadata) -> Option<u32> {
+        None
+    }
+
+    #[cfg(unix)]
     fn get_gid(&self, metadata: &std::fs::Metadata) -> Option<u32> {
-        #[cfg(unix)]
-        {
-            Some(metadata.gid())
-        }
-        #[cfg(not(unix))]
-        {
-            None
-        }
+        Some(metadata.gid())
+    }
+
+    #[cfg(not(unix))]
+    fn get_gid(&self, _metadata: &std::fs::Metadata) -> Option<u32> {
+        None
     }
 }
 
@@ -233,7 +214,6 @@ mod tests {
     fn test_scan_directory() {
         let dir = tempdir().unwrap();
         
-        // Create some files
         File::create(dir.path().join("file1.txt")).unwrap();
         File::create(dir.path().join("file2.txt")).unwrap();
         std::fs::create_dir(dir.path().join("subdir")).unwrap();
@@ -249,14 +229,12 @@ mod tests {
     fn test_hidden_files() {
         let dir = tempdir().unwrap();
         
-        // Create hidden file
         File::create(dir.path().join(".hidden")).unwrap();
         File::create(dir.path().join("normal.txt")).unwrap();
 
         let scanner = FileScanner::new(vec![], vec![], false);
         let files = scanner.scan_paths(&[dir.path().to_path_buf()]).unwrap();
         
-        // Should include hidden file
         assert_eq!(files.len(), 2);
         
         let hidden_exists = files.iter().any(|f| f.path.to_string_lossy().ends_with(".hidden"));

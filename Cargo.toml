@@ -12,10 +12,13 @@ categories = ["command-line-utilities", "compression"]
 readme = "README.md"
 
 [profile.release]
-lto = true
 codegen-units = 1
-opt-level = 3
+lto = true
+opt-level = "s"
+panic = "abort"
+split-debuginfo = "packed"
 strip = true
+incremental = true
 
 [dependencies]
 # CLI and user interaction
@@ -39,7 +42,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"], optional = true }
 sha2 = { version = "0.10", optional = true }
 hex = "0.4"
 
-# Concurrency
+# Concurrency and parallelism
 rayon = "1.8"
 tokio = { version = "1.36", features = ["rt", "macros"] }
 futures = "0.3"
@@ -61,7 +64,7 @@ path-clean = "1.0"
 
 # Cross-platform
 dirs = "5.0"
-whoami = "1.4"  # Remplace users pour être cross-platform
+whoami = "1.4"
 normpath = "1.1"
 platform-info = "0.2"
 
@@ -77,47 +80,41 @@ env_logger = "0.11"
 sysinfo = "0.30"
 num_cpus = "1.16"
 
-# Regular expressions
+# Regular expressions for pattern matching
 regex = "1.10"
 
-# UUID
+# UUID for snapshot IDs
 uuid = { version = "1.7", features = ["v4", "serde"] }
 
-# Progress formatting
+# Progress and formatting
 atty = "0.2"
 termcolor = "1.4"
 
-# Error handling
+# Error handling and utilities
 derive_more = "0.99"
 
-# Build info
+# For build info
 rustc_version_runtime = "0.3"
 
-# Dépendances Unix uniquement
+# Platform-specific dependencies
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.28", features = ["fs", "user"] }
 unix_mode = "0.1"
-# Note: users n'est plus utilisé, on utilise whoami à la place
+users = "0.11"
 
-# Dépendances Windows uniquement
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = [
-    "fileapi", 
-    "winbase", 
-    "securitybaseapi", 
-    "accctrl", 
+    "fileapi",
+    "winbase",
+    "securitybaseapi",
+    "accctrl",
     "winnt",
     "synchapi",
     "handleapi",
     "errhandlingapi"
 ] }
-windows-sys = { version = "0.52", features = [
-    "Win32_Foundation",
-    "Win32_Storage_FileSystem",
-    "Win32_Security",
-    "Win32_System_Threading",
-    "Win32_System_IO"
-] }
+windows-sys = "0.52"
+regex = "1.10"  # Déjà en dépendance principale, mais on le met pour Windows aussi
 
 [dev-dependencies]
 tempfile = "3.9"
@@ -144,7 +141,7 @@ sha256 = ["dep:sha2"]
 # All features
 full = ["zstd", "xz", "blake3", "xxhash", "sha256"]
 
-# Features spécifiques à la plateforme
+# Platform-specific features
 unix = []
 windows = []
 
