@@ -1,7 +1,7 @@
 //! Create command implementation
 
 use clap::Args;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use anyhow::Result;
 use crate::utils::config::Config;
 use crate::core::archive::Archive;
@@ -13,6 +13,7 @@ use crate::core::hash::HashAlgorithm;
 use crate::utils::progress::ProgressBar;
 use crate::utils::parse_duration;
 use crate::utils::retry::RetryConfig;
+use crate::core::archive::ProcessResult;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};

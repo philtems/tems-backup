@@ -32,11 +32,11 @@ indicatif = "0.17"
 # Database
 rusqlite = { version = "0.31", features = ["bundled", "trace", "blob", "series"] }
 
-# Compression (optional)
+# Compression (en option)
 zstd = { version = "0.13", optional = true }
 xz2 = { version = "0.1", optional = true }
 
-# Hashing (optional)
+# Hashing (en option)
 blake3 = { version = "1.5", optional = true }
 xxhash-rust = { version = "0.8", features = ["xxh3"], optional = true }
 sha2 = { version = "0.10", optional = true }
@@ -96,6 +96,10 @@ derive_more = "0.99"
 # For build info
 rustc_version_runtime = "0.3"
 
+# OPTIMISATIONS DATABASE (en option - bloom filter retiré pour l'instant)
+lru = { version = "0.12", optional = true }
+memmap2 = { version = "0.9", optional = true }
+
 # Platform-specific dependencies
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.28", features = ["fs", "user"] }
@@ -126,7 +130,7 @@ test-case = "3.3"
 rustc_version = "0.4"
 
 [features]
-default = ["zstd", "blake3"]
+default = ["zstd", "blake3", "xxhash", "sha256", "xz", "cache"]
 
 # Compression features
 zstd = ["dep:zstd"]
@@ -137,10 +141,13 @@ blake3 = ["dep:blake3"]
 xxhash = ["dep:xxhash-rust"]
 sha256 = ["dep:sha2"]
 
-# All features
-full = ["zstd", "xz", "blake3", "xxhash", "sha256"]
+# Optimisation features (sans bloom)
+cache = ["dep:lru", "dep:memmap2"]
 
-# Platform-specific features
+# All features
+full = ["zstd", "xz", "blake3", "xxhash", "sha256", "cache"]
+
+# Platform-specific features (just for information)
 unix = []
 windows = []
 

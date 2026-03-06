@@ -61,9 +61,16 @@ impl Chunker {
         }
     }
 
-    /// Split file into chunks
+    /// Split file into chunks (handles empty files correctly)
     pub fn chunk_file<P: AsRef<Path>>(&self, path: P) -> Result<Vec<Chunk>> {
         let file = File::open(path)?;
+        let metadata = file.metadata()?;
+        
+        // Special case: empty file
+        if metadata.len() == 0 {
+            return Ok(Vec::new());
+        }
+
         let mut reader = BufReader::new(file);
         let mut chunks = Vec::new();
         let mut buffer = vec![0u8; self.chunk_size];
@@ -254,6 +261,22 @@ mod tests {
         assert_eq!(chunks[0].size, 1024);
         assert_eq!(chunks[1].size, 1024);
         assert_eq!(chunks[2].size, 452);
+    }
+
+    #[test]
+    fn test_empty_file() {
+        let chunker = Chunker::new(
+            1024,
+            HashAlgorithm::Blake3,
+            CompressionAlgorithm::Zstd,
+            3,
+        );
+        
+        let file = NamedTempFile::new().unwrap();
+        // File is empty
+        
+        let chunks = chunker.chunk_file(file.path()).unwrap();
+        assert_eq!(chunks.len(), 0); // Empty file should return empty chunk list
     }
 }
 

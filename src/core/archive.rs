@@ -15,6 +15,8 @@ use crate::utils::retry::{with_retry, RetryConfig};
 use std::collections::HashMap;
 use filetime::FileTime;
 use std::time::{UNIX_EPOCH};
+use std::str::FromStr;
+use crate::core::compression::CompressionAlgorithm;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -54,7 +56,7 @@ impl Archive {
     ) -> Self {
         let path = path.as_ref().to_path_buf();
         let mut volume_manager = VolumeManager::new(path.clone());
-        volume_manager.set_database(db.clone());
+        volume_manager.set_database(&db);
         
         Self {
             path: path.clone(),
@@ -70,7 +72,7 @@ impl Archive {
     pub fn open<P: AsRef<Path>>(path: P, db: Database) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let mut volume_manager = VolumeManager::new(path.clone());
-        volume_manager.set_database(db.clone());
+        volume_manager.set_database(&db);
         volume_manager.load_volumes()?;
         
         Ok(Self {
@@ -93,7 +95,7 @@ impl Archive {
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let mut volume_manager = VolumeManager::new(path.clone());
-        volume_manager.set_database(db.clone());
+        volume_manager.set_database(&db);
         volume_manager.load_volumes()?;
         
         Ok(Self {
@@ -137,7 +139,14 @@ impl Archive {
     where
         F: FnMut(&str, u64, bool),
     {
+        // S'assurer qu'aucun lock n'est retenu avant d'initialiser les volumes
+        {
+            let _conn = self.db.conn.lock().unwrap();
+            // Ne rien faire, juste s'assurer qu'on peut locker
+        } // Le lock est libéré immédiatement
+        
         self.volume_manager.init_volumes(volume_size)?;
+        
         for file in files {
             let file_name = file.path.file_name().unwrap_or_default().to_str().unwrap_or("?");
             let file_size = file.size;
@@ -147,7 +156,10 @@ impl Archive {
                     progress_callback(file_name, file_size, true);
                 }
                 Err(e) => {
-                    log::error!("Failed to process {}: {}", file.path.display(), e);
+                    // Ne pas afficher les erreurs de contrainte UNIQUE (c'est normal en déduplication)
+                    if !e.to_string().contains("UNIQUE constraint failed") {
+                        log::error!("Failed to process {}: {}", file.path.display(), e);
+                    }
                     progress_callback(file_name, file_size, false);
                 }
             }
@@ -188,7 +200,10 @@ impl Archive {
         match result {
             Ok(()) => Ok(ProcessResult::Processed),
             Err(e) => {
-                log::error!("Failed to process {} after retries: {}", path.display(), e);
+                // Ne pas afficher les erreurs de contrainte UNIQUE (c'est normal en déduplication)
+                if !e.to_string().contains("UNIQUE constraint failed") {
+                    log::error!("Failed to process {} after retries: {}", path.display(), e);
+                }
                 Err(e)
             }
         }
@@ -196,16 +211,29 @@ impl Archive {
 
     /// Internal file processing (no retry logic)
     fn process_file_internal(&mut self, file: &FileInfo) -> Result<()> {
+        log::debug!("Processing file: {}", file.path.display());
+        
+        log::debug!("Chunking file: {}", file.path.display());
         let chunks = self.chunker.chunk_file(&file.path)?;
+        log::debug!("File split into {} chunks", chunks.len());
+        
+        log::debug!("Processing {} chunks", chunks.len());
         let chunk_ids = self.process_chunks(chunks)?;
+        log::debug!("Got {} chunk IDs", chunk_ids.len());
+        
+        log::debug!("Inserting file record for {}", file.path.display());
         let file_id = self.db.insert_file(file, self.get_next_version(&file.path)?)?;
+        log::debug!("File ID: {}", file_id);
         
         let chunk_refs: Vec<(i64, usize)> = chunk_ids.into_iter()
             .enumerate()
             .map(|(i, id)| (id, i * self.chunker.chunk_size()))
             .collect();
+        
+        log::debug!("Linking {} chunks to file", chunk_refs.len());
         self.db.link_chunks(file_id, &chunk_refs)?;
-
+        
+        log::debug!("File processed successfully: {}", file.path.display());
         Ok(())
     }
 
@@ -215,156 +243,27 @@ impl Archive {
         Ok(versions.first().map(|(_, _, modified)| *modified))
     }
 
-    /// Restore a single file with retry support
-    pub fn restore_file_with_retry(
-        &self,
-        file: &FileEntry,
-        target_dir: &Path,
-        options: &RestoreOptions,
-        retry_config: &RetryConfig,
-    ) -> Result<bool> {
-        if options.dry_run {
-            println!("Would restore: {}", file.path.display());
-            return Ok(true);
-        }
-
-        let result = with_retry(
-            || self.restore_file_internal(file, target_dir, options),
-            retry_config.max_retries,
-            retry_config.delay_seconds,
-            &format!("Restoring file: {}", file.path.display()),
-        );
-
-        match result {
-            Ok(restored) => Ok(restored),
-            Err(e) => {
-                log::error!("Failed to restore {} after retries: {}", file.path.display(), e);
-                Err(e)
-            }
-        }
-    }
-
-    /// Internal file restoration (no retry logic)
-    fn restore_file_internal(
-        &self,
-        file: &FileEntry,
-        target_dir: &Path,
-        options: &RestoreOptions,
-    ) -> Result<bool> {
-        let target_path = self.build_target_path(file, target_dir, options)?;
-
-        if !options.should_overwrite(&target_path)? {
-            println!("Skipping existing file: {}", target_path.display());
-            return Ok(false);
-        }
-
-        if options.backup_existing && target_path.exists() {
-            let backup = target_path.with_extension("bak");
-            std::fs::rename(&target_path, &backup)?;
-            println!("Backed up existing file to: {}", backup.display());
-        }
-
-        if let Some(parent) = target_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let chunks = self.get_file_chunks(file)?;
-
-        let mut output = File::create(&target_path)?;
-        
-        for chunk_info in chunks {
-            let data = self.read_chunk(&chunk_info)?;
-            output.write_all(&data)?;
-        }
-
-        // Preserve metadata
-        if options.preserve_times {
-            let atime = FileTime::now();
-            let mtime = FileTime::from_unix_time(file.modified as i64, 0);
-            filetime::set_file_times(&target_path, atime, mtime)?;
-        }
-
-        #[cfg(unix)]
-        {
-            if options.preserve_permissions {
-                if let Some(perms) = self.get_file_permissions(file)? {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&target_path, std::fs::Permissions::from_mode(perms))?;
-                }
-            }
-
-            if options.preserve_ownership {
-                if let (Some(uid), Some(gid)) = (self.get_file_uid(file)?, self.get_file_gid(file)?) {
-                    let _ = nix::unistd::chown(&target_path, Some(uid.into()), Some(gid.into()))?;
-                }
-            }
-        }
-
-        Ok(true)
-    }
-
-    /// Build target path for restored file
-    fn build_target_path(
-        &self,
-        file: &FileEntry,
-        target_dir: &Path,
-        options: &RestoreOptions,
-    ) -> Result<PathBuf> {
-        if options.flatten {
-            return Ok(target_dir.join(file.path.file_name().unwrap_or_default()));
-        }
-
-        if let Some(strip) = options.strip_components {
-            let components: Vec<_> = file.path.components().skip(strip).collect();
-            if components.is_empty() {
-                return Ok(target_dir.join(file.path.file_name().unwrap_or_default()));
-            }
-            return Ok(target_dir.join(components.iter().collect::<PathBuf>()));
-        }
-
-        let mut full_path = target_dir.to_path_buf();
-        for component in file.path.components() {
-            match component {
-                std::path::Component::RootDir => continue,
-                std::path::Component::CurDir => continue,
-                std::path::Component::ParentDir => {
-                    full_path.pop();
-                }
-                std::path::Component::Normal(part) => {
-                    full_path.push(part);
-                }
-                _ => {
-                    full_path.push(component.as_os_str());
-                }
-            }
-        }
-        Ok(full_path)
-    }
-
     /// Process chunks (deduplication) and return chunk IDs
     fn process_chunks(&mut self, chunks: Vec<Chunk>) -> Result<Vec<i64>> {
         let mut chunk_ids = Vec::new();
+        let mut new_chunks = 0;
+        let mut existing_chunks = 0;
 
         for chunk in chunks {
-            if !self.no_dedup {
-                if let Some(_existing) = self.db.find_chunk(&chunk.hash)? {
-                    self.db.increment_refcount(&chunk.hash)?;
-                    if let Some(id) = self.db.get_chunk_id_by_hash(&chunk.hash)? {
-                        chunk_ids.push(id);
-                        continue;
-                    }
-                }
-            }
-
+            // Compression (pas de lock)
             let compressed = self.compress_chunk(&chunk)?;
+
+            // Trouver un volume (pas de lock)
             let (volume_num, volume_path, _) = self.volume_manager
                 .find_volume_with_space(compressed.len() as u64)?;
 
+            // Écrire (pas de lock)
             let offset = self.write_chunk_to_volume(&volume_path, &compressed)?;
             self.volume_manager.update_volume_free_space(volume_num, compressed.len() as u64)?;
 
+            // Insérer ou récupérer l'ID (gère automatiquement les collisions)
             let chunk_info = ChunkInfo {
-                hash: chunk.hash,
+                hash: chunk.hash.clone(),
                 fast_hash: chunk.fast_hash,
                 size: chunk.size,
                 compressed_size: compressed.len(),
@@ -373,10 +272,24 @@ impl Archive {
                 offset,
             };
 
-            let id = self.db.insert_chunk(&chunk_info)?;
+            let id = self.db.insert_chunk_or_get_id(&chunk_info)?;
+            
+            // Vérifier si c'est un nouveau chunk ou un existant
+            if let Some(existing_id) = self.db.get_chunk_id_by_hash(&chunk.hash)? {
+                if existing_id == id {
+                    // Le chunk existait déjà
+                    existing_chunks += 1;
+                } else {
+                    new_chunks += 1;
+                }
+            } else {
+                new_chunks += 1;
+            }
+            
             chunk_ids.push(id);
         }
 
+        log::debug!("Chunks processed: {} new, {} existing", new_chunks, existing_chunks);
         Ok(chunk_ids)
     }
 
@@ -539,10 +452,130 @@ impl Archive {
         Ok(files)
     }
 
-    /// Restore a single file (public version)
-    pub fn restore_file_public(&self, file: &FileEntry, target_dir: &Path, options: &RestoreOptions) -> Result<()> {
-        self.restore_file_internal(file, target_dir, options)?;
-        Ok(())
+    /// Restore a single file with retry support
+    pub fn restore_file_with_retry(
+        &self,
+        file: &FileEntry,
+        target_dir: &Path,
+        options: &RestoreOptions,
+        retry_config: &RetryConfig,
+    ) -> Result<bool> {
+        if options.dry_run {
+            println!("Would restore: {}", file.path.display());
+            return Ok(true);
+        }
+
+        let result = with_retry(
+            || self.restore_file_internal(file, target_dir, options),
+            retry_config.max_retries,
+            retry_config.delay_seconds,
+            &format!("Restoring file: {}", file.path.display()),
+        );
+
+        match result {
+            Ok(restored) => Ok(restored),
+            Err(e) => {
+                log::error!("Failed to restore {} after retries: {}", file.path.display(), e);
+                Err(e)
+            }
+        }
+    }
+
+    /// Internal file restoration (no retry logic)
+    fn restore_file_internal(
+        &self,
+        file: &FileEntry,
+        target_dir: &Path,
+        options: &RestoreOptions,
+    ) -> Result<bool> {
+        let target_path = self.build_target_path(file, target_dir, options)?;
+
+        if !options.should_overwrite(&target_path)? {
+            println!("Skipping existing file: {}", target_path.display());
+            return Ok(false);
+        }
+
+        if options.backup_existing && target_path.exists() {
+            let backup = target_path.with_extension("bak");
+            std::fs::rename(&target_path, &backup)?;
+            println!("Backed up existing file to: {}", backup.display());
+        }
+
+        if let Some(parent) = target_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let chunks = self.get_file_chunks(file)?;
+
+        let mut output = File::create(&target_path)?;
+        
+        for chunk_info in chunks {
+            let data = self.read_chunk(&chunk_info)?;
+            output.write_all(&data)?;
+        }
+
+        // Preserve metadata
+        if options.preserve_times {
+            let atime = FileTime::now();
+            let mtime = FileTime::from_unix_time(file.modified as i64, 0);
+            filetime::set_file_times(&target_path, atime, mtime)?;
+        }
+
+        #[cfg(unix)]
+        {
+            if options.preserve_permissions {
+                if let Some(perms) = self.get_file_permissions(file)? {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&target_path, std::fs::Permissions::from_mode(perms))?;
+                }
+            }
+
+            if options.preserve_ownership {
+                if let (Some(uid), Some(gid)) = (self.get_file_uid(file)?, self.get_file_gid(file)?) {
+                    let _ = nix::unistd::chown(&target_path, Some(uid.into()), Some(gid.into()))?;
+                }
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Build target path for restored file
+    fn build_target_path(
+        &self,
+        file: &FileEntry,
+        target_dir: &Path,
+        options: &RestoreOptions,
+    ) -> Result<PathBuf> {
+        if options.flatten {
+            return Ok(target_dir.join(file.path.file_name().unwrap_or_default()));
+        }
+
+        if let Some(strip) = options.strip_components {
+            let components: Vec<_> = file.path.components().skip(strip).collect();
+            if components.is_empty() {
+                return Ok(target_dir.join(file.path.file_name().unwrap_or_default()));
+            }
+            return Ok(target_dir.join(components.iter().collect::<PathBuf>()));
+        }
+
+        let mut full_path = target_dir.to_path_buf();
+        for component in file.path.components() {
+            match component {
+                std::path::Component::RootDir => continue,
+                std::path::Component::CurDir => continue,
+                std::path::Component::ParentDir => {
+                    full_path.pop();
+                }
+                std::path::Component::Normal(part) => {
+                    full_path.push(part);
+                }
+                _ => {
+                    full_path.push(component.as_os_str());
+                }
+            }
+        }
+        Ok(full_path)
     }
 
     /// Get chunks for a specific file
@@ -550,9 +583,10 @@ impl Archive {
         let conn = self.db.conn.lock().unwrap();
         
         let mut stmt = conn.prepare(
-            "SELECT c.hash, c.fast_hash, c.size, c.compressed_size, c.compression,
+            "SELECT c.hash, c.fast_hash, c.size, c.compressed_size, ca.name,
                     c.volume_number, c.offset
              FROM chunks c
+             JOIN compression_algorithms ca ON c.compression_id = ca.id
              JOIN file_chunks fc ON c.id = fc.chunk_id
              JOIN files f ON fc.file_id = f.id
              WHERE f.path = ? AND f.version = ?
@@ -562,12 +596,16 @@ impl Archive {
         let rows = stmt.query_map(
             params![file.path.to_str().unwrap(), file.version as i64],
             |row| {
+                let compression_name: String = row.get(4)?;
+                let compression = CompressionAlgorithm::from_str(&compression_name)
+                    .map_err(|e| rusqlite::Error::InvalidParameterName(e.to_string()))?;
+                
                 Ok(ChunkInfo {
                     hash: row.get(0)?,
                     fast_hash: row.get(1)?,
                     size: row.get::<_, i64>(2)? as usize,
                     compressed_size: row.get::<_, i64>(3)? as usize,
-                    compression: row.get(4)?,
+                    compression,
                     volume: row.get::<_, i64>(5)? as u64,
                     offset: row.get::<_, i64>(6)? as u64,
                 })

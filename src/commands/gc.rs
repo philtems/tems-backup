@@ -29,6 +29,10 @@ pub struct GcArgs {
     /// Show progress
     #[arg(short = 'p', long)]
     pub progress: bool,
+
+    /// Optimize database after GC (vacuum, reindex)
+    #[arg(long)]
+    pub optimize: bool,
 }
 
 pub fn execute(args: GcArgs, _config: &crate::utils::config::Config) -> Result<()> {
@@ -51,6 +55,13 @@ pub fn execute(args: GcArgs, _config: &crate::utils::config::Config) -> Result<(
     
     if orphans.is_empty() {
         println!("No orphaned chunks found. Archive is clean.");
+        
+        if args.optimize {
+            println!("Optimizing database...");
+            db.optimize()?;
+            println!("Database optimized.");
+        }
+        
         return Ok(());
     }
 
@@ -139,6 +150,17 @@ pub fn execute(args: GcArgs, _config: &crate::utils::config::Config) -> Result<(
     // Vacuum database to reclaim space
     println!("Optimizing database...");
     db.vacuum()?;
+    
+    if args.optimize {
+        println!("Running full optimization...");
+        db.optimize()?;
+    }
+
+    // Show cache stats
+    let stats = db.get_stats()?;
+    if let Some(hit_ratio) = stats.get("cache_hit_ratio") {
+        println!("Cache hit ratio: {}", hit_ratio);
+    }
 
     println!("Garbage collection completed successfully!");
     Ok(())
