@@ -3,22 +3,6 @@
 use std::thread;
 use std::time::Duration;
 use log::{warn, error};
-use thiserror::Error;
-
-#[derive(Error, Debug)]
-pub enum RetryableError {
-    #[error("Transient error: {0}")]
-    Transient(String),
-
-    #[error("Permanent error: {0}")]
-    Permanent(String),
-}
-
-impl RetryableError {
-    pub fn is_retryable(&self) -> bool {
-        matches!(self, RetryableError::Transient(_))
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct RetryConfig {

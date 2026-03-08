@@ -39,11 +39,6 @@ pub fn execute(args: DiffArgs, _config: &crate::utils::config::Config) -> Result
     println!("Comparing versions of: {}", args.path);
     println!("(Diff implementation pending)");
     
-    // In a real implementation, this would:
-    // 1. Extract both versions
-    // 2. Generate unified diff
-    // 3. Display with context
-    
     Ok(())
 }
 

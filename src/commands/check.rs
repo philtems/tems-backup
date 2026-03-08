@@ -6,6 +6,7 @@ use anyhow::Result;
 use crate::storage::database::Database;
 use crate::storage::volume::VolumeManager;
 use crate::utils::progress::ProgressBar;
+use crate::commands::create::format_size;
 
 #[derive(Args)]
 pub struct CheckArgs {
@@ -46,6 +47,7 @@ pub fn execute(args: CheckArgs, _config: &crate::utils::config::Config) -> Resul
 
     let db = Database::open(&db_path)?;
     let mut volume_manager = VolumeManager::new(args.archive.clone());
+    volume_manager.set_database(db.clone());
     volume_manager.load_volumes()?;
 
     // Check database integrity
@@ -116,18 +118,5 @@ pub fn execute(args: CheckArgs, _config: &crate::utils::config::Config) -> Resul
 
     println!("\nCheck completed");
     Ok(())
-}
-
-fn format_size(size: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut size = size as f64;
-    let mut unit = 0;
-    
-    while size >= 1024.0 && unit < 4 {
-        size /= 1024.0;
-        unit += 1;
-    }
-    
-    format!("{:.2} {}", size, UNITS[unit])
 }
 

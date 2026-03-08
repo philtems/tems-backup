@@ -11,6 +11,7 @@ mod core;
 mod storage;
 mod utils;
 mod error;
+mod remote;  // ← Nouveau module
 
 use commands::*;
 use utils::config::Config;
@@ -18,7 +19,7 @@ use utils::config::Config;
 #[derive(Parser)]
 #[command(name = "tems-backup")]
 #[command(author = "Philippe TEMESI <philippe@tems.be>")]
-#[command(version = "0.1.0")]
+#[command(version = "0.2.0")]  // ← Nouvelle version
 #[command(about = "Advanced backup tool with deduplication and versioning", long_about = None)]
 struct Cli {
     /// Verbose mode (-v, -vv, -vvv)
@@ -29,19 +30,23 @@ struct Cli {
     #[arg(short, long, value_name = "FILE")]
     config: Option<PathBuf>,
 
+    /// Authentication file for remote (login:password or ssh key path)
+    #[arg(short = 'A', long, value_name = "FILE")]
+    auth_file: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Create a new backup archive
+    /// Create a new backup archive (local or remote)
     Create(create::CreateArgs),
 
-    /// Add files to an existing archive
+    /// Add files to an existing archive (local or remote)
     Add(add::AddArgs),
 
-    /// Restore files from an archive
+    /// Restore files from an archive (local or remote)
     Restore(restore::RestoreArgs),
 
     /// List files in archive
@@ -63,7 +68,6 @@ enum Commands {
     Volume(volume::VolumeArgs),
 }
 
-// Re-export constants from lib.rs
 pub use tems_backup::{VERSION, YEAR, AUTHOR, DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, VOLUME_NUMBER_DIGITS};
 
 fn main() -> Result<()> {
@@ -78,9 +82,9 @@ fn main() -> Result<()> {
 
     // Execute command
     match cli.command {
-        Commands::Create(args) => create::execute(args, &config),
-        Commands::Add(args) => add::execute(args, &config),
-        Commands::Restore(args) => restore::execute(args, &config),
+        Commands::Create(args) => create::execute(args, &config, cli.auth_file),
+        Commands::Add(args) => add::execute(args, &config, cli.auth_file),
+        Commands::Restore(args) => restore::execute(args, &config, cli.auth_file),
         Commands::List(args) => list::execute(args, &config),
         Commands::Log(args) => log::execute(args, &config),
         Commands::Diff(args) => diff::execute(args, &config),

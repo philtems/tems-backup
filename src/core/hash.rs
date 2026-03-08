@@ -1,6 +1,8 @@
 //! Hash algorithms for deduplication and integrity
 
 use std::fmt;
+use std::str::FromStr;
+use anyhow::{Result, anyhow};
 
 #[cfg(feature = "blake3")]
 use blake3;
@@ -11,7 +13,7 @@ use xxhash_rust;
 #[cfg(feature = "sha256")]
 use sha2;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum HashAlgorithm {
     XxHash3,
     Blake3,
@@ -28,6 +30,18 @@ impl fmt::Display for HashAlgorithm {
     }
 }
 
+impl FromStr for HashAlgorithm {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "xxhash3" | "xxh3" => Ok(HashAlgorithm::XxHash3),
+            "blake3" => Ok(HashAlgorithm::Blake3),
+            "sha256" => Ok(HashAlgorithm::Sha256),
+            _ => Err(anyhow!("Unknown hash algorithm: {}", s)),
+        }
+    }
+}
+
 pub trait Hasher {
     fn hash(&self, data: &[u8]) -> Vec<u8>;
     fn hash_fast(&self, data: &[u8]) -> u64;
@@ -37,10 +51,10 @@ pub trait Hasher {
 pub struct XxHash3Hasher;
 
 impl Hasher for XxHash3Hasher {
-    fn hash(&self, data: &[u8]) -> Vec<u8> {
+    fn hash(&self, _data: &[u8]) -> Vec<u8> {
         #[cfg(feature = "xxhash")]
         {
-            xxhash_rust::xxh3::xxh3_64(data).to_le_bytes().to_vec()
+            xxhash_rust::xxh3::xxh3_64(_data).to_le_bytes().to_vec()
         }
         #[cfg(not(feature = "xxhash"))]
         {
@@ -48,10 +62,10 @@ impl Hasher for XxHash3Hasher {
         }
     }
 
-    fn hash_fast(&self, data: &[u8]) -> u64 {
+    fn hash_fast(&self, _data: &[u8]) -> u64 {
         #[cfg(feature = "xxhash")]
         {
-            xxhash_rust::xxh3::xxh3_64(data)
+            xxhash_rust::xxh3::xxh3_64(_data)
         }
         #[cfg(not(feature = "xxhash"))]
         {
@@ -145,13 +159,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_from_str() {
+        assert_eq!(HashAlgorithm::from_str("xxhash3").unwrap(), HashAlgorithm::XxHash3);
+        assert_eq!(HashAlgorithm::from_str("xxh3").unwrap(), HashAlgorithm::XxHash3);
+        assert_eq!(HashAlgorithm::from_str("blake3").unwrap(), HashAlgorithm::Blake3);
+        assert_eq!(HashAlgorithm::from_str("sha256").unwrap(), HashAlgorithm::Sha256);
+        assert!(HashAlgorithm::from_str("unknown").is_err());
+    }
+
+    #[test]
     fn test_xxhash3() {
         #[cfg(feature = "xxhash")]
         {
             let hasher = XxHash3Hasher;
             let data = b"test data";
             let hash = hasher.hash(data);
-            assert_eq!(hash.len(), 8); // 64 bits
+            assert_eq!(hash.len(), 8);
         }
     }
 
@@ -162,7 +185,7 @@ mod tests {
             let hasher = Blake3Hasher;
             let data = b"test data";
             let hash = hasher.hash(data);
-            assert_eq!(hash.len(), 32); // 256 bits
+            assert_eq!(hash.len(), 32);
         }
     }
 
@@ -173,7 +196,7 @@ mod tests {
             let hasher = Sha256Hasher;
             let data = b"test data";
             let hash = hasher.hash(data);
-            assert_eq!(hash.len(), 32); // 256 bits
+            assert_eq!(hash.len(), 32);
         }
     }
 }

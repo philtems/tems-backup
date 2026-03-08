@@ -5,7 +5,7 @@ use clap::Args;
 use std::path::PathBuf;
 use anyhow::Result;
 use crate::storage::database::Database;
-use crate::storage::volume::VolumeManager;
+use crate::storage::volume::{VolumeManager, VolumeStatus};
 use crate::commands::create::{parse_size, format_size};
 
 #[derive(Subcommand)]
@@ -70,6 +70,7 @@ pub fn execute(args: VolumeArgs, _config: &crate::utils::config::Config) -> Resu
 
     let db = Database::open(&db_path)?;
     let mut volume_manager = VolumeManager::new(args.archive.clone());
+    volume_manager.set_database(db.clone());
     volume_manager.load_volumes()?;
 
     match args.command {
@@ -113,10 +114,10 @@ fn list_volumes(volume_manager: &VolumeManager, args: ListArgs) -> Result<()> {
                 format_size(used),
                 format_size(free),
                 match info.status {
-                    crate::storage::volume::VolumeStatus::Active => "active",
-                    crate::storage::volume::VolumeStatus::Full => "full",
-                    crate::storage::volume::VolumeStatus::Closed => "closed",
-                    crate::storage::volume::VolumeStatus::Corrupted => "CORRUPTED",
+                    VolumeStatus::Active => "active",
+                    VolumeStatus::Full => "full",
+                    VolumeStatus::Closed => "closed",
+                    VolumeStatus::Corrupted => "CORRUPTED",
                 }
             );
 

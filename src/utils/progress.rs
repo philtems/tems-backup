@@ -5,7 +5,7 @@ use std::time::Duration;
 
 pub enum ProgressBar {
     Bar(IndicatifBar),
-    Multi(MultiProgress, IndicatifBar, IndicatifBar, IndicatifBar),
+    Multi(MultiProgress, IndicatifBar, IndicatifBar),
     None,
 }
 
@@ -33,41 +33,21 @@ impl ProgressBar {
         ProgressBar::Bar(bar)
     }
 
-    /// Dual progress bar for backup/add (files and data)
-    pub fn new_dual_backup_bar(total_files: u64, total_bytes: u64) -> Self {
-        let multi = MultiProgress::new();
-        
-        // Files progress bar
-        let files_bar = multi.add(IndicatifBar::new(total_files));
-        files_bar.set_style(
+    /// Progress bar for backup/add (files only, monothread)
+    pub fn new_backup_bar(total_files: u64) -> Self {
+        let bar = IndicatifBar::new(total_files);
+        bar.set_style(
             ProgressStyle::default_bar()
-                .template("{spinner} [{elapsed_precise}] [{bar:40}] {pos}/{len} files ({percent}%)\n")
+                .template("{spinner} [{elapsed_precise}] [{bar:40}] {pos}/{len} files ({percent}%)\n{msg}\n{prefix} ETA: {eta}")
                 .unwrap()
                 .progress_chars("█▓▒░ ")
         );
-        files_bar.set_message("Files");
         
-        // Data progress bar
-        let data_bar = multi.add(IndicatifBar::new(total_bytes));
-        data_bar.set_style(
-            ProgressStyle::default_bar()
-                .template("├─ Data: {bytes} / {total_bytes} ({bytes_per_sec}) [{bar:40}] {msg}\n")
-                .unwrap()
-                .progress_chars("█▓▒░ ")
-        );
-        data_bar.set_message("Processing...");
+        bar.set_position(0);
+        bar.set_message("Initializing...");
+        bar.set_prefix("");
         
-        // Speed and ETA line
-        let speed_bar = multi.add(IndicatifBar::new(100));
-        speed_bar.set_style(
-            ProgressStyle::default_bar()
-                .template("└─ Files/sec: {msg} | ETA: {eta}")
-                .unwrap()
-        );
-        speed_bar.set_message("0");
-        speed_bar.set_position(0);
-        
-        ProgressBar::Multi(multi, files_bar, data_bar, speed_bar)
+        ProgressBar::Bar(bar)
     }
 
     /// Dual progress bar for restore (files and data)
@@ -78,7 +58,7 @@ impl ProgressBar {
         let files_bar = multi.add(IndicatifBar::new(total_files));
         files_bar.set_style(
             ProgressStyle::default_bar()
-                .template("{spinner} [{elapsed_precise}] [{bar:40}] {pos}/{len} files ({percent}%)\n")
+                .template("{spinner} [{elapsed_precise}] [{bar:40}] {pos}/{len} files ({percent}%)\n{prefix}\n")
                 .unwrap()
                 .progress_chars("█▓▒░ ")
         );
@@ -94,17 +74,7 @@ impl ProgressBar {
         );
         data_bar.set_message("Restoring...");
         
-        // Speed and ETA line
-        let speed_bar = multi.add(IndicatifBar::new(100));
-        speed_bar.set_style(
-            ProgressStyle::default_bar()
-                .template("└─ Files/sec: {msg} | ETA: {eta}")
-                .unwrap()
-        );
-        speed_bar.set_message("0");
-        speed_bar.set_position(0);
-        
-        ProgressBar::Multi(multi, files_bar, data_bar, speed_bar)
+        ProgressBar::Multi(multi, files_bar, data_bar)
     }
 
     /// Progress bar for garbage collection (chunks)
@@ -113,9 +83,7 @@ impl ProgressBar {
         bar.set_style(
             ProgressStyle::default_bar()
                 .template(
-                    "{spinner} [{elapsed_precise}] [{bar:40}] {pos}/{len} chunks\n\
-                     ⤷ {msg}\n\
-                     └─ ETA: {eta}"
+                    "{spinner} [{elapsed_precise}] [{bar:40}] {pos}/{len} chunks\n{msg}\nETA: {eta}"
                 )
                 .unwrap()
                 .progress_chars("█▓▒░ ")
@@ -133,9 +101,7 @@ impl ProgressBar {
         bar.set_style(
             ProgressStyle::default_bar()
                 .template(
-                    "{spinner} [{elapsed_precise}] [{bar:40}] {pos}/{len} items\n\
-                     ⤷ {msg}\n\
-                     └─ ETA: {eta}"
+                    "{spinner} [{elapsed_precise}] [{bar:40}] {pos}/{len} items\n{msg}\nETA: {eta}"
                 )
                 .unwrap()
                 .progress_chars("█▓▒░ ")
@@ -150,7 +116,7 @@ impl ProgressBar {
     pub fn set_message(&self, msg: String) {
         match self {
             ProgressBar::Bar(bar) => bar.set_message(msg),
-            ProgressBar::Multi(_, files_bar, data_bar, _) => {
+            ProgressBar::Multi(_, files_bar, data_bar) => {
                 files_bar.set_message(format!("File: {}", msg));
                 data_bar.set_message(msg);
             }
@@ -158,35 +124,42 @@ impl ProgressBar {
         }
     }
 
+    pub fn set_prefix(&self, prefix: String) {
+        match self {
+            ProgressBar::Bar(bar) => bar.set_prefix(prefix),
+            ProgressBar::Multi(_, files_bar, _) => files_bar.set_prefix(prefix),
+            ProgressBar::None => {}
+        }
+    }
+
     pub fn set_files_message(&self, msg: String) {
-        if let ProgressBar::Multi(_, files_bar, _, _) = self {
+        if let ProgressBar::Multi(_, files_bar, _) = self {
             files_bar.set_message(msg);
         }
     }
 
     pub fn set_data_message(&self, msg: String) {
-        if let ProgressBar::Multi(_, _, data_bar, _) = self {
+        if let ProgressBar::Multi(_, _, data_bar) = self {
             data_bar.set_message(msg);
         }
     }
 
     pub fn set_files_speed(&self, files_per_sec: f64) {
-        if let ProgressBar::Multi(_, _, _, speed_bar) = self {
-            let speed_str = Self::format_files_per_sec(files_per_sec);
-            speed_bar.set_message(speed_str);
+        if let ProgressBar::Multi(_, files_bar, _) = self {
+            files_bar.set_prefix(format!("{:.1} files/s", files_per_sec));
         }
     }
 
     pub fn inc(&self, delta: u64) {
         match self {
             ProgressBar::Bar(bar) => bar.inc(delta),
-            ProgressBar::Multi(_, files_bar, _, _) => files_bar.inc(delta),
+            ProgressBar::Multi(_, files_bar, _) => files_bar.inc(delta),
             ProgressBar::None => {}
         }
     }
 
     pub fn inc_data(&self, delta: u64) {
-        if let ProgressBar::Multi(_, _, data_bar, _) = self {
+        if let ProgressBar::Multi(_, _, data_bar) = self {
             data_bar.inc(delta);
         }
     }
@@ -194,13 +167,13 @@ impl ProgressBar {
     pub fn set_position(&self, pos: u64) {
         match self {
             ProgressBar::Bar(bar) => bar.set_position(pos),
-            ProgressBar::Multi(_, files_bar, _, _) => files_bar.set_position(pos),
+            ProgressBar::Multi(_, files_bar, _) => files_bar.set_position(pos),
             ProgressBar::None => {}
         }
     }
 
     pub fn set_data_position(&self, pos: u64) {
-        if let ProgressBar::Multi(_, _, data_bar, _) = self {
+        if let ProgressBar::Multi(_, _, data_bar) = self {
             data_bar.set_position(pos);
         }
     }
@@ -208,24 +181,23 @@ impl ProgressBar {
     pub fn set_length(&self, len: u64) {
         match self {
             ProgressBar::Bar(bar) => bar.set_length(len),
-            ProgressBar::Multi(_, files_bar, _, _) => files_bar.set_length(len),
+            ProgressBar::Multi(_, files_bar, _) => files_bar.set_length(len),
             ProgressBar::None => {}
         }
     }
 
     pub fn set_data_length(&self, len: u64) {
-        if let ProgressBar::Multi(_, _, data_bar, _) = self {
+        if let ProgressBar::Multi(_, _, data_bar) = self {
             data_bar.set_length(len);
         }
     }
 
     pub fn finish(&self) {
         match self {
-            ProgressBar::Bar(bar) => bar.finish(),
-            ProgressBar::Multi(multi, files_bar, data_bar, speed_bar) => {
-                files_bar.finish();
-                data_bar.finish();
-                speed_bar.finish();
+            ProgressBar::Bar(bar) => bar.finish_and_clear(),
+            ProgressBar::Multi(multi, files_bar, data_bar) => {
+                files_bar.finish_and_clear();
+                data_bar.finish_and_clear();
                 multi.clear().ok();
             }
             ProgressBar::None => {}
@@ -234,28 +206,11 @@ impl ProgressBar {
 
     pub fn println(&self, msg: &str) {
         match self {
-            ProgressBar::Bar(bar) => bar.println(msg),
-            ProgressBar::Multi(multi, _, _, _) => {
+            ProgressBar::Bar(bar) => bar.suspend(|| println!("{}", msg)),
+            ProgressBar::Multi(multi, _, _) => {
                 multi.println(msg).ok();
             }
             ProgressBar::None => println!("{}", msg),
-        }
-    }
-
-    /// Format files per second in human-readable form
-    fn format_files_per_sec(fps: f64) -> String {
-        if fps < 0.01 {
-            format!("{:.2} files/hour", fps * 3600.0)
-        } else if fps < 0.1 {
-            format!("{:.2} files/min", fps * 60.0)
-        } else if fps < 1.0 {
-            format!("{:.1} files/min", fps * 60.0)
-        } else if fps < 10.0 {
-            format!("{:.2} files/s", fps)
-        } else if fps < 100.0 {
-            format!("{:.1} files/s", fps)
-        } else {
-            format!("{:.0} files/s", fps)
         }
     }
 }

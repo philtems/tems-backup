@@ -8,6 +8,7 @@
 //! - **Versioning**: Keep history of all file changes
 //! - **Compression**: Zstandard (zstd) or XZ compression
 //! - **Multi-volume**: Split archives into multiple files
+//! - **Remote storage**: SFTP and WebDAV support
 //! - **Cross-platform**: Works on Linux, BSD, macOS, and Windows
 //! - **SQLite index**: Fast and reliable metadata storage
 //! - **Integrity checking**: Verify archive integrity
@@ -52,6 +53,7 @@ pub mod core;
 pub mod storage;
 pub mod utils;
 pub mod error;
+pub mod remote;  // ← AJOUTER CETTE LIGNE
 
 /// Current version of tems-backup
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

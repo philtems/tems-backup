@@ -72,6 +72,15 @@ pub enum TemsError {
 
     #[error("Ignore error: {0}")]
     Ignore(#[from] ignore::Error),
+
+    #[error("Remote error: {0}")]
+    Remote(String),  // ← Nouvelle variante
+}
+
+impl From<anyhow::Error> for TemsError {
+    fn from(err: anyhow::Error) -> Self {
+        TemsError::Remote(err.to_string())
+    }
 }
 
 pub type Result<T> = std::result::Result<T, TemsError>;

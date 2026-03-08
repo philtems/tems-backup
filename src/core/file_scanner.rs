@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use ignore::{WalkBuilder};
 use anyhow::Result;
-use rayon::prelude::*;
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -39,7 +38,7 @@ impl FileScanner {
             exclude_patterns,
             include_patterns,
             exclude_caches,
-            follow_symlinks: false,
+            follow_symlinks: true,
             max_depth: None,
             hidden: true,
         }
@@ -50,13 +49,10 @@ impl FileScanner {
     }
 
     pub fn scan_paths(&self, paths: &[PathBuf]) -> Result<Vec<FileInfo>> {
-        let results: Vec<Result<Vec<FileInfo>>> = paths.par_iter()
-            .map(|path| self.scan_single_path(path))
-            .collect();
-
         let mut all_files = Vec::new();
-        for result in results {
-            all_files.extend(result?);
+        
+        for path in paths {
+            all_files.extend(self.scan_single_path(path)?);
         }
 
         Ok(all_files)
@@ -85,7 +81,8 @@ impl FileScanner {
             .git_ignore(false)
             .git_global(false)
             .git_exclude(false)
-            .parents(false);
+            .parents(false)
+            .filter_entry(|_| true);
 
         if self.exclude_caches {
             walker.filter_entry(|entry| {

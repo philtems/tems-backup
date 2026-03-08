@@ -30,7 +30,7 @@ pub struct GcArgs {
     #[arg(short = 'p', long)]
     pub progress: bool,
 
-    /// Optimize database after GC (vacuum, reindex)
+    /// Optimize database after GC
     #[arg(long)]
     pub optimize: bool,
 }
@@ -47,9 +47,10 @@ pub fn execute(args: GcArgs, _config: &crate::utils::config::Config) -> Result<(
 
     let db = Database::open(&db_path)?;
     let mut volume_manager = VolumeManager::new(args.archive.clone());
+    volume_manager.set_database(db.clone());
     volume_manager.load_volumes()?;
 
-    // Find orphaned chunks (reference_count = 0)
+    // Find orphaned chunks
     println!("Scanning for orphaned chunks...");
     let orphans = db.get_orphaned_chunks()?;
     
@@ -58,7 +59,7 @@ pub fn execute(args: GcArgs, _config: &crate::utils::config::Config) -> Result<(
         
         if args.optimize {
             println!("Optimizing database...");
-            db.optimize()?;
+            db.vacuum()?;
             println!("Database optimized.");
         }
         
@@ -107,14 +108,14 @@ pub fn execute(args: GcArgs, _config: &crate::utils::config::Config) -> Result<(
         None
     };
 
-    // Group orphans by volume for efficient processing
+    // Group orphans by volume
     let mut by_volume: std::collections::HashMap<u64, Vec<(Vec<u8>, u64)>> = 
         std::collections::HashMap::new();
     
     for (hash, volume, size) in orphans {
         by_volume.entry(volume)
             .or_insert_with(Vec::new)
-            .push((hash, size));
+            .push((hash.into_bytes(), size));
     }
 
     // Process each volume
@@ -129,11 +130,6 @@ pub fn execute(args: GcArgs, _config: &crate::utils::config::Config) -> Result<(
             pb.set_position(processed as u64);
         }
         
-        // In a real implementation, you would:
-        // 1. Open the volume file
-        // 2. Mark chunks as free (or rewrite volume without them)
-        // 3. Update volume free space
-        
         for (hash, _) in chunks {
             log::debug!("Would delete chunk {} from volume {}", hex::encode(&hash[..8]), volume_num);
         }
@@ -147,20 +143,9 @@ pub fn execute(args: GcArgs, _config: &crate::utils::config::Config) -> Result<(
     let deleted = db.delete_orphaned_chunks()?;
     println!("Removed {} chunks from database", deleted);
 
-    // Vacuum database to reclaim space
+    // Vacuum database
     println!("Optimizing database...");
     db.vacuum()?;
-    
-    if args.optimize {
-        println!("Running full optimization...");
-        db.optimize()?;
-    }
-
-    // Show cache stats
-    let stats = db.get_stats()?;
-    if let Some(hit_ratio) = stats.get("cache_hit_ratio") {
-        println!("Cache hit ratio: {}", hit_ratio);
-    }
 
     println!("Garbage collection completed successfully!");
     Ok(())

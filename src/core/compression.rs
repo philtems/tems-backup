@@ -1,12 +1,13 @@
 //! Compression algorithms support
 
 use std::fmt;
-use crate::error::{Result, TemsError};
+use std::str::FromStr;
+use anyhow::{Result, anyhow};
 
 #[cfg(feature = "xz")]
 use xz2;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CompressionAlgorithm {
     Zstd,
     Xz,
@@ -19,6 +20,18 @@ impl fmt::Display for CompressionAlgorithm {
             CompressionAlgorithm::Zstd => write!(f, "zstd"),
             CompressionAlgorithm::Xz => write!(f, "xz"),
             CompressionAlgorithm::None => write!(f, "none"),
+        }
+    }
+}
+
+impl FromStr for CompressionAlgorithm {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "zstd" => Ok(CompressionAlgorithm::Zstd),
+            "xz" => Ok(CompressionAlgorithm::Xz),
+            "none" => Ok(CompressionAlgorithm::None),
+            _ => Err(anyhow!("Unknown compression: {}", s)),
         }
     }
 }
@@ -44,23 +57,23 @@ impl Compressor for ZstdCompressor {
         #[cfg(feature = "zstd")]
         {
             zstd::bulk::compress(data, self.level)
-                .map_err(|e| TemsError::Compression(e.to_string()))
+                .map_err(|e| anyhow!("Zstd compression error: {}", e))
         }
         #[cfg(not(feature = "zstd"))]
         {
-            Err(TemsError::Compression("zstd support not enabled".into()))
+            Err(anyhow!("zstd support not enabled"))
         }
     }
 
     fn decompress(&mut self, data: &[u8]) -> Result<Vec<u8>> {
         #[cfg(feature = "zstd")]
         {
-            zstd::bulk::decompress(data, 1024 * 1024) // Max 1MB
-                .map_err(|e| TemsError::Compression(e.to_string()))
+            zstd::bulk::decompress(data, 1024 * 1024)
+                .map_err(|e| anyhow!("Zstd decompression error: {}", e))
         }
         #[cfg(not(feature = "zstd"))]
         {
-            Err(TemsError::Compression("zstd support not enabled".into()))
+            Err(anyhow!("zstd support not enabled"))
         }
     }
 
@@ -80,33 +93,33 @@ impl XzCompressor {
 }
 
 impl Compressor for XzCompressor {
-    fn compress(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+    fn compress(&mut self, _data: &[u8]) -> Result<Vec<u8>> {
         #[cfg(feature = "xz")]
         {
             use std::io::Write;
             let mut encoder = xz2::write::XzEncoder::new(Vec::new(), self.level);
-            encoder.write_all(data)?;
+            encoder.write_all(_data)?;
             encoder.finish()
-                .map_err(|e| TemsError::Compression(e.to_string()))
+                .map_err(|e| anyhow!("XZ compression error: {}", e))
         }
         #[cfg(not(feature = "xz"))]
         {
-            Err(TemsError::Compression("xz support not enabled".into()))
+            Err(anyhow!("xz support not enabled"))
         }
     }
 
-    fn decompress(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+    fn decompress(&mut self, _data: &[u8]) -> Result<Vec<u8>> {
         #[cfg(feature = "xz")]
         {
             use std::io::Read;
-            let mut decoder = xz2::read::XzDecoder::new(data);
+            let mut decoder = xz2::read::XzDecoder::new(_data);
             let mut decompressed = Vec::new();
             decoder.read_to_end(&mut decompressed)?;
             Ok(decompressed)
         }
         #[cfg(not(feature = "xz"))]
         {
-            Err(TemsError::Compression("xz support not enabled".into()))
+            Err(anyhow!("xz support not enabled"))
         }
     }
 

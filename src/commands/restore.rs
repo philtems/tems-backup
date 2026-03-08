@@ -9,15 +9,24 @@ use crate::storage::database::Database;
 use crate::utils::progress::ProgressBar;
 use crate::commands::create::format_size;
 use crate::utils::retry::RetryConfig;
+use crate::remote::{self, RemoteLocation, AuthInfo};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 #[derive(Args)]
 pub struct RestoreArgs {
-    /// Archive path
-    #[arg(required = true)]
-    pub archive: PathBuf,
+    /// Local archive path (required if not using --sftp or --webdav)
+    #[arg(required_unless_present = "sftp", required_unless_present = "webdav")]
+    pub archive: Option<PathBuf>,
+
+    /// SFTP remote source (format: user@host:port/path)
+    #[arg(long)]
+    pub sftp: Option<String>,
+
+    /// WebDAV remote source (URL: http://host/path or https://host/path)
+    #[arg(long)]
+    pub webdav: Option<String>,
 
     /// Files/directories to restore (restore all if not specified)
     pub paths: Vec<PathBuf>,
@@ -93,27 +102,68 @@ pub struct RestoreArgs {
     /// Delay between retries in seconds
     #[arg(long, default_value_t = 5)]
     pub retry_delay: u64,
+
+    /// Keep volume files locally after use (remote mode only)
+    #[arg(long)]
+    pub keep_volumes: bool,
 }
 
-pub fn execute(args: RestoreArgs, _config: &Config) -> Result<()> {
+pub fn execute(args: RestoreArgs, config: &Config, auth_file: Option<PathBuf>) -> Result<()> {
     println!("tems-backup v{} - Restoring from archive", crate::VERSION);
-    println!("Archive: {}", args.archive.display());
 
-    // Open database
-    let db_path = args.archive.with_extension("db");
+    // Déterminer le mode
+    let mode = if let Some(sftp_src) = &args.sftp {
+        println!("Mode: SFTP remote restore");
+        RemoteMode::Sftp(sftp_src.clone())
+    } else if let Some(webdav_src) = &args.webdav {
+        println!("Mode: WebDAV remote restore");
+        RemoteMode::Webdav(webdav_src.clone())
+    } else if let Some(local_path) = &args.archive {
+        println!("Mode: Local restore");
+        println!("Archive: {}", local_path.display());
+        RemoteMode::Local(local_path.clone())
+    } else {
+        unreachable!("clap ensures one of these is present");
+    };
+
+    match mode {
+        RemoteMode::Local(local_path) => {
+            execute_local_restore(args, config, local_path)
+        }
+        RemoteMode::Sftp(remote_src) => {
+            execute_remote_restore(args, config, auth_file, remote_src, "sftp")
+        }
+        RemoteMode::Webdav(remote_src) => {
+            execute_remote_restore(args, config, auth_file, remote_src, "webdav")
+        }
+    }
+}
+
+enum RemoteMode {
+    Local(PathBuf),
+    Sftp(String),
+    Webdav(String),
+}
+
+fn execute_local_restore(
+    args: RestoreArgs,
+    _config: &Config,
+    archive_path: PathBuf,
+) -> Result<()> {
+    // Ouvrir DB locale
+    let db_path = archive_path.with_extension("db");
     if !db_path.exists() {
-        return Err(anyhow::anyhow!("Archive not found: {}", args.archive.display()));
+        return Err(anyhow::anyhow!("Archive not found: {}", archive_path.display()));
     }
     let db = Database::open(&db_path)?;
 
-    // Open archive
-    let archive = Archive::open(args.archive.clone(), db)?;
+    // Ouvrir archive
+    let archive = Archive::open(archive_path, db)?;
 
-    // Determine target directory
+    // Options de restauration
     let target = args.target.unwrap_or_else(|| PathBuf::from("."));
     std::fs::create_dir_all(&target)?;
 
-    // Build restore options
     let options = RestoreOptions {
         paths: args.paths,
         version: args.version,
@@ -132,13 +182,12 @@ pub fn execute(args: RestoreArgs, _config: &Config) -> Result<()> {
         dry_run: args.dry_run,
     };
 
-    // Create retry configuration
     let retry_config = RetryConfig {
         max_retries: args.retry,
         delay_seconds: args.retry_delay,
     };
 
-    // Get files to restore
+    // Obtenir fichiers à restaurer
     let files = archive.get_files_for_restore(&options)?;
     
     if files.is_empty() {
@@ -146,18 +195,133 @@ pub fn execute(args: RestoreArgs, _config: &Config) -> Result<()> {
         return Ok(());
     }
 
-    // Calculate total size
     let total_size: u64 = files.iter().map(|f| f.size).sum();
     println!("Found {} files to restore (total: {})", files.len(), format_size(total_size));
+
+    // Restaurer
+    restore_files(&archive, files, &target, &options, &retry_config, args.progress)?;
+
+    Ok(())
+}
+
+fn execute_remote_restore(
+    args: RestoreArgs,
+    config: &Config,
+    auth_file: Option<PathBuf>,
+    remote_src: String,
+    protocol: &str,
+) -> Result<()> {
+    // Parser destination
+    let location = if protocol == "sftp" {
+        RemoteLocation::from_sftp_str(&remote_src)?
+    } else {
+        RemoteLocation::from_webdav_str(&remote_src)?
+    };
+
+    // Charger auth
+    let auth = if let Some(auth_path) = auth_file {
+        AuthInfo::from_file(&auth_path, Some(&location.user))?
+    } else {
+        if location.user.is_empty() {
+            return Err(anyhow::anyhow!("Username required"));
+        }
+        let password = rpassword::prompt_password("Password: ")?;
+        AuthInfo {
+            username: location.user.clone(),
+            password: Some(password),
+            key_file: None,
+            passphrase: None,
+        }
+    };
+
+    // Créer storage
+    let storage = remote::create_remote_storage(location, auth, config.remote.temp_dir.clone().unwrap_or_else(|| std::env::temp_dir()))?;
+
+    // Répertoire de travail local
+    let temp_dir = config.remote.temp_dir.clone().unwrap_or_else(|| std::env::temp_dir()).join(format!("tems-backup-{}", std::process::id()));
+    std::fs::create_dir_all(&temp_dir)?;
+
+    println!("Working directory: {}", temp_dir.display());
+
+    // Télécharger DB
+    let db_path = temp_dir.join("archive.db");
+    if !storage.exists(Path::new("archive.db"))? {
+        return Err(anyhow::anyhow!("Remote archive not found"));
+    }
+    println!("Downloading database...");
+    storage.download_file(Path::new("archive.db"), &db_path)?;
+
+    // Ouvrir DB
+    let db = Database::open(&db_path)?;
+
+    // Options de restauration
+    let target = args.target.unwrap_or_else(|| PathBuf::from("."));
+    std::fs::create_dir_all(&target)?;
+
+    let options = RestoreOptions {
+        paths: args.paths,
+        version: args.version,
+        as_of: args.as_of,
+        all_versions: args.all_versions,
+        snapshot: args.snapshot,
+        overwrite: args.overwrite,
+        skip_existing: args.skip_existing,
+        backup_existing: args.backup_existing,
+        interactive: args.interactive,
+        preserve_permissions: args.preserve_permissions,
+        preserve_ownership: args.preserve_ownership,
+        preserve_times: args.preserve_times,
+        strip_components: args.strip_components,
+        flatten: args.flatten,
+        dry_run: args.dry_run,
+    };
+
+    // Ouvrir archive avec support remote
+    let archive = Archive::open_with_remote(
+        temp_dir.join("archive.tms"),
+        db,
+        storage,
+        args.keep_volumes,
+    )?;
+
+    // Obtenir fichiers à restaurer
+    let files = archive.get_files_for_restore(&options)?;
     
-    if args.retry != 0 {
-        println!("Retry: {} attempts, {}s delay", 
-            if args.retry == -1 { "infinite".to_string() } else { args.retry.to_string() },
-            args.retry_delay);
+    if files.is_empty() {
+        println!("No files found to restore");
+        return Ok(());
     }
 
-    // Progress bar
-    let progress_bar = if args.progress {
+    let total_size: u64 = files.iter().map(|f| f.size).sum();
+    println!("Found {} files to restore (total: {})", files.len(), format_size(total_size));
+
+    let retry_config = RetryConfig {
+        max_retries: args.retry,
+        delay_seconds: args.retry_delay,
+    };
+
+    // Restaurer
+    restore_files(&archive, files, &target, &options, &retry_config, args.progress)?;
+
+    // Nettoyer
+    if !args.keep_volumes {
+        std::fs::remove_dir_all(temp_dir)?;
+    }
+
+    Ok(())
+}
+
+fn restore_files(
+    archive: &Archive,
+    files: Vec<crate::core::archive::FileEntry>,
+    target: &Path,
+    options: &RestoreOptions,
+    retry_config: &RetryConfig,
+    show_progress: bool,
+) -> Result<()> {
+    let total_size: u64 = files.iter().map(|f| f.size).sum();
+    
+    let progress_bar = if show_progress {
         Some(ProgressBar::new_dual_restore_bar(files.len() as u64, total_size))
     } else {
         None
@@ -167,14 +331,11 @@ pub fn execute(args: RestoreArgs, _config: &Config) -> Result<()> {
     let restored_bytes = Arc::new(AtomicU64::new(0));
     let failed_files = Arc::new(AtomicUsize::new(0));
     let start_time = Arc::new(Instant::now());
-    let progress_bar_ref = progress_bar.as_ref();
 
-    // Restore files
     for file in files {
-        if let Some(pb) = &progress_bar_ref {
+        if let Some(pb) = &progress_bar {
             let current_files = restored_files.fetch_add(1, Ordering::Relaxed) + 1;
             
-            // Calculate files per second
             let elapsed = start_time.elapsed().as_secs_f64();
             let files_per_sec = if elapsed > 0.0 {
                 current_files as f64 / elapsed
@@ -183,25 +344,30 @@ pub fn execute(args: RestoreArgs, _config: &Config) -> Result<()> {
             };
             
             pb.set_files_message(format!("Restoring: {}", file.path.display()));
-            pb.set_files_speed(files_per_sec);
             pb.set_position(current_files);
+            
+            if let ProgressBar::Multi(_, files_bar, _) = pb {
+                files_bar.set_prefix(format!("{:.1} files/s", files_per_sec));
+            }
         }
 
-        match archive.restore_file_with_retry(&file, &target, &options, &retry_config) {
+        match archive.restore_file_with_retry(&file, target, options, retry_config) {
             Ok(true) => {
                 restored_bytes.fetch_add(file.size, Ordering::Relaxed);
-                if let Some(pb) = progress_bar_ref {
+                if let Some(pb) = &progress_bar {
                     pb.set_data_position(restored_bytes.load(Ordering::Relaxed));
+                    pb.println(&format!("✅ Restored: {}", file.path.display()));
                 }
             }
             Ok(false) => {
-                // File was skipped (already exists, etc.)
-                if let Some(pb) = progress_bar_ref {
-                    pb.println(&format!("Skipped: {}", file.path.display()));
+                if let Some(pb) = &progress_bar {
+                    pb.println(&format!("⏭️  Skipped: {}", file.path.display()));
                 }
             }
             Err(e) => {
-                eprintln!("Failed to restore {}: {}", file.path.display(), e);
+                if let Some(pb) = &progress_bar {
+                    pb.println(&format!("❌ Failed to restore {}: {}", file.path.display(), e));
+                }
                 failed_files.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -251,14 +417,13 @@ impl RestoreOptions {
         } else if self.skip_existing {
             Ok(false)
         } else if self.backup_existing {
-            Ok(true) // Will rename existing
+            Ok(true)
         } else if self.interactive {
             use dialoguer::Confirm;
             Ok(Confirm::new()
                 .with_prompt(format!("File {} exists. Overwrite?", path.display()))
                 .interact()?)
         } else {
-            // Default: don't overwrite
             Ok(false)
         }
     }

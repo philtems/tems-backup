@@ -11,7 +11,6 @@ pub struct Config {
     pub default_chunk_size: String,
     pub default_hash: String,
     pub temp_dir: PathBuf,
-    pub threads: usize,
 
     #[serde(default)]
     pub volumes: VolumeConfig,
@@ -21,6 +20,9 @@ pub struct Config {
 
     #[serde(default)]
     pub advanced: AdvancedConfig,
+
+    #[serde(default)]
+    pub remote: RemoteConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,6 +46,14 @@ pub struct AdvancedConfig {
     pub verify_writes: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]  // ← Default enlevé d'ici
+pub struct RemoteConfig {
+    pub timeout_seconds: u64,
+    pub retry_attempts: u32,
+    pub temp_dir: Option<PathBuf>,
+    pub keep_volumes: bool,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -52,10 +62,10 @@ impl Default for Config {
             default_chunk_size: "1M".to_string(),
             default_hash: "blake3".to_string(),
             temp_dir: std::env::temp_dir().join("tems-backup"),
-            threads: num_cpus::get(),
             volumes: VolumeConfig::default(),
             exclude: ExcludeConfig::default(),
             advanced: AdvancedConfig::default(),
+            remote: RemoteConfig::default(),
         }
     }
 }
@@ -95,13 +105,23 @@ impl Default for AdvancedConfig {
     }
 }
 
+impl Default for RemoteConfig {  // ← L'implémentation manuelle reste
+    fn default() -> Self {
+        Self {
+            timeout_seconds: 30,
+            retry_attempts: 3,
+            temp_dir: None,
+            keep_volumes: false,
+        }
+    }
+}
+
 impl Config {
     /// Load configuration from file
     pub fn load(path: Option<PathBuf>) -> Result<Self> {
         let config_path = if let Some(path) = path {
             path
         } else {
-            // Try default locations
             Self::find_config_file()?
         };
 

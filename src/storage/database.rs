@@ -1,43 +1,36 @@
-//! SQLite database management for index with optimizations
+//! SQLite database management for index
 
 use rusqlite::{Connection, params};
-use rusqlite::types::{ToSql, FromSql, ValueRef};
+use rusqlite::OptionalExtension;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
-use lru::LruCache;
-use std::num::NonZeroUsize;
+use std::time::UNIX_EPOCH;
 use std::str::FromStr;
 use crate::error::{Result, TemsError};
 use crate::core::chunk::ChunkInfo;
 use crate::core::file_scanner::FileInfo;
 use crate::core::compression::CompressionAlgorithm;
-use std::time::{UNIX_EPOCH};
+use crate::core::hash::HashAlgorithm;
 
-// Taille du cache LRU (nombre d'entrées)
-const CACHE_SIZE: usize = 10000;
-
-// Statistiques de la base de données
-#[derive(Debug, Default, Clone)]
-pub struct DbStats {
-    pub cache_hits: u64,
-    pub cache_misses: u64,
-    pub query_times_ms: Vec<f64>,
-    pub total_queries: u64,
+#[derive(Debug, Clone)]
+pub struct ArchiveConfig {
+    pub chunk_size: usize,
+    pub compression: CompressionAlgorithm,
+    pub compression_level: i32,
+    pub hash_algorithm: HashAlgorithm,
+    pub created_at: i64,
+    pub version: u32,
 }
 
 #[derive(Debug, Clone)]
 pub struct Database {
     pub conn: Arc<Mutex<Connection>>,
     path: PathBuf,
-    // Cache LRU pour les hash (fast_hash -> hash complet)
-    hash_cache: Arc<Mutex<LruCache<u64, Vec<u8>>>>,
-    // Statistiques
-    stats: Arc<Mutex<DbStats>>,
+    config: Arc<Mutex<Option<ArchiveConfig>>>,
 }
 
 impl Database {
-    /// Open or create database with optimizations
+    /// Open or create database
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         
@@ -48,60 +41,28 @@ impl Database {
 
         let conn = Connection::open(&path)?;
         
-        // === OPTIMISATIONS SQLITE ===
-        // Journal mode WAL pour meilleures performances en écriture
+        // Configure database
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        
-        // Synchronous NORMAL pour équilibre sécurité/performance
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        
-        // Cache size plus grand (2GB) - valeur négative = kilo-octets
-        conn.pragma_update(None, "cache_size", -2000000)?;
-        
-        // Temp store en mémoire
+        conn.pragma_update(None, "cache_size", -64000)?;
         conn.pragma_update(None, "temp_store", "MEMORY")?;
-        
-        // Mmap size (en octets) - utiliser une valeur qui tient dans i32
-        // 1GB = 1073741824, c'est dans les limites de i32
-        conn.pragma_update(None, "mmap_size", 1073741824)?; // 1GB au lieu de 30GB
-        
-        // Page size plus grand pour meilleure compression
-        conn.pragma_update(None, "page_size", 16384)?;
-        
-        // Auto vacuum pour garder la base compacte
-        conn.pragma_update(None, "auto_vacuum", "FULL")?;
 
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
-            path: path.clone(),
-            hash_cache: Arc::new(Mutex::new(LruCache::new(
-                NonZeroUsize::new(CACHE_SIZE).unwrap()
-            ))),
-            stats: Arc::new(Mutex::new(DbStats::default())),
+            path,
+            config: Arc::new(Mutex::new(None)),
         };
 
-        // Initialize schema
         db.init_schema()?;
-        
-        // Optimize database
-        db.optimize()?;
 
         Ok(db)
     }
 
-    /// Initialize database schema with optimized indexes
+    /// Initialize database schema
     fn init_schema(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        
-        // Vérifier si la table volumes existe
-        let table_exists: i32 = conn.query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='volumes'",
-            [],
-            |row| row.get(0)
-        ).unwrap_or(0);
-        log::debug!("Table 'volumes' exists: {}", table_exists > 0);
 
-        // Table des algorithmes de compression (normalisation)
+        // Compression algorithms
         conn.execute(
             "CREATE TABLE IF NOT EXISTS compression_algorithms (
                 id INTEGER PRIMARY KEY,
@@ -110,18 +71,48 @@ impl Database {
             [],
         )?;
 
-        // Insérer les algorithmes par défaut - utiliser execute pour INSERT
         conn.execute(
             "INSERT OR IGNORE INTO compression_algorithms (name) VALUES 
              ('zstd'), ('xz'), ('none')",
             [],
         )?;
 
-        // Create chunks table avec index optimisés
+        // Hash algorithms
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS hash_algorithms (
+                id INTEGER PRIMARY KEY,
+                name TEXT UNIQUE NOT NULL
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "INSERT OR IGNORE INTO hash_algorithms (name) VALUES 
+             ('xxhash3'), ('blake3'), ('sha256')",
+            [],
+        )?;
+
+        // Archive configuration
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS archive_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                chunk_size INTEGER NOT NULL,
+                compression_id INTEGER NOT NULL,
+                compression_level INTEGER NOT NULL,
+                hash_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                version INTEGER DEFAULT 1,
+                FOREIGN KEY (compression_id) REFERENCES compression_algorithms(id),
+                FOREIGN KEY (hash_id) REFERENCES hash_algorithms(id)
+            )",
+            [],
+        )?;
+
+        // Chunks table with hash as TEXT (hex)
         conn.execute(
             "CREATE TABLE IF NOT EXISTS chunks (
                 id INTEGER PRIMARY KEY,
-                hash BLOB NOT NULL UNIQUE,
+                hash TEXT NOT NULL UNIQUE,
                 fast_hash INTEGER NOT NULL,
                 size INTEGER NOT NULL,
                 compressed_size INTEGER NOT NULL,
@@ -136,25 +127,17 @@ impl Database {
             [],
         )?;
 
-        // Index sur fast_hash pour recherches rapides
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_chunks_fast_hash ON chunks(fast_hash)",
             [],
         )?;
 
-        // Index sur volume_number
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_chunks_volume ON chunks(volume_number)",
             [],
         )?;
 
-        // Index sur reference_count pour GC
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_chunks_refcount ON chunks(reference_count)",
-            [],
-        )?;
-
-        // Create files table
+        // Files table
         conn.execute(
             "CREATE TABLE IF NOT EXISTS files (
                 id INTEGER PRIMARY KEY,
@@ -165,7 +148,7 @@ impl Database {
                 permissions INTEGER,
                 uid INTEGER,
                 gid INTEGER,
-                hash BLOB,
+                hash TEXT,
                 version INTEGER DEFAULT 1,
                 deleted BOOLEAN DEFAULT 0,
                 created_at INTEGER DEFAULT (strftime('%s', 'now'))
@@ -178,12 +161,7 @@ impl Database {
             [],
         )?;
 
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_files_modified ON files(modified_time)",
-            [],
-        )?;
-
-        // Create file_chunks association
+        // File chunks association
         conn.execute(
             "CREATE TABLE IF NOT EXISTS file_chunks (
                 file_id INTEGER NOT NULL,
@@ -197,17 +175,12 @@ impl Database {
             [],
         )?;
 
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_file_chunks_chunk ON file_chunks(chunk_id)",
-            [],
-        )?;
-
-        // Create volumes table
+        // Volumes table
         conn.execute(
             "CREATE TABLE IF NOT EXISTS volumes (
                 number INTEGER PRIMARY KEY,
                 filename TEXT NOT NULL,
-                size INTEGER NOT NULL,
+                size INTEGER NOT NULL DEFAULT 0,
                 max_size INTEGER,
                 free_space INTEGER NOT NULL,
                 status TEXT DEFAULT 'active',
@@ -216,158 +189,113 @@ impl Database {
             [],
         )?;
 
-        // Create stats table
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS stats (
-                key TEXT PRIMARY KEY,
-                value TEXT,
-                updated_at INTEGER DEFAULT (strftime('%s', 'now'))
-            )",
-            [],
-        )?;
-
-        // Create view for current files
+        // Current files view
         conn.execute(
             "CREATE VIEW IF NOT EXISTS current_files AS 
-             SELECT * FROM files 
-             WHERE deleted = 0 
-             AND version = (
+             SELECT f1.* FROM files f1
+             WHERE f1.deleted = 0 
+             AND f1.version = (
                  SELECT MAX(version) 
                  FROM files f2 
-                 WHERE f2.path = files.path
+                 WHERE f2.path = f1.path
              )",
             [],
         )?;
 
-        // Lire la version actuelle (pour consommer le résultat)
-        let _: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        // Mettre à jour la version
-        conn.execute("PRAGMA user_version = 2", [])?;
-
         Ok(())
     }
 
-    /// Optimize database (vacuum, reindex, analyze)
-    pub fn optimize(&self) -> Result<()> {
+    /// Save archive configuration
+    pub fn save_config(&self, config: &ArchiveConfig) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         
-        log::info!("Optimizing database...");
-        
-        // Reconstruire les index - utiliser execute_batch
-        conn.execute_batch("REINDEX;")?;
-        
-        // Analyser les statistiques
-        conn.execute_batch("ANALYZE;")?;
-        
-        // Vider le WAL - PRAGMA retourne un résultat, donc on utilise query_row
-        let _: i32 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
-        
-        // VACUUM pour compresser
-        conn.execute_batch("VACUUM;")?;
-        
-        Ok(())
-    }
-
-    /// Get database statistics
-    pub fn get_db_stats(&self) -> DbStats {
-        self.stats.lock().unwrap().clone()
-    }
-
-    /// Find chunk by hash with cache optimization
-    pub fn find_chunk(&self, hash: &[u8], fast_hash: u64) -> Result<Option<ChunkInfo>> {
-        let start = Instant::now();
-        let mut stats = self.stats.lock().unwrap();
-        stats.total_queries += 1;
-
-        // 1. Cache LRU
-        {
-            let mut cache = self.hash_cache.lock().unwrap();
-            if let Some(cached_hash) = cache.get(&fast_hash) {
-                if cached_hash == hash {
-                    stats.cache_hits += 1;
-                    // Cache hit, mais il faut quand même chercher les infos
-                    drop(cache); // Libérer le cache avant la requête SQL
-                    let result = self.get_chunk_info_by_hash(hash)?;
-                    stats.query_times_ms.push(start.elapsed().as_micros() as f64 / 1000.0);
-                    if stats.query_times_ms.len() > 1000 {
-                        stats.query_times_ms.remove(0);
-                    }
-                    return Ok(result);
-                }
-            }
-        }
-
-        stats.cache_misses += 1;
-
-        // 2. Recherche en base (optimisée par index)
-        let result = self.find_chunk_in_db(hash, fast_hash)?;
-
-        // 3. Mettre à jour le cache si trouvé
-        if let Some(ref chunk) = result {
-            let mut cache = self.hash_cache.lock().unwrap();
-            cache.put(fast_hash, chunk.hash.clone());
-        }
-
-        stats.query_times_ms.push(start.elapsed().as_micros() as f64 / 1000.0);
-        if stats.query_times_ms.len() > 1000 {
-            stats.query_times_ms.remove(0);
-        }
-
-        Ok(result)
-    }
-
-    /// Find chunk in database (internal method)
-    fn find_chunk_in_db(&self, hash: &[u8], fast_hash: u64) -> Result<Option<ChunkInfo>> {
-        let conn = self.conn.lock().unwrap();
-        
-        // Recherche d'abord par fast_hash (index compact)
-        let mut stmt = conn.prepare(
-            "SELECT c.hash, c.size, c.compressed_size, ca.name,
-                    c.volume_number, c.offset, c.reference_count
-             FROM chunks c
-             JOIN compression_algorithms ca ON c.compression_id = ca.id
-             WHERE c.fast_hash = ?"
+        let compression_id: i64 = conn.query_row(
+            "SELECT id FROM compression_algorithms WHERE name = ?",
+            [config.compression.to_string()],
+            |row| row.get(0)
         )?;
-
-        let mut rows = stmt.query([fast_hash as i64])?;
         
-        // Parcourir les collisions potentielles (très rares)
-        while let Some(row) = rows.next()? {
-            let stored_hash: Vec<u8> = row.get(0)?;
-            if stored_hash == hash {
-                // Trouvé !
-                let size: i64 = row.get(1)?;
-                let compressed_size: i64 = row.get(2)?;
-                let volume: i64 = row.get(4)?;
-                let offset: i64 = row.get(5)?;
-                
-                // Convertir le nom de compression en enum
-                let compression_name: String = row.get(3)?;
-                let compression = CompressionAlgorithm::from_str(&compression_name)
-                    .map_err(|e| TemsError::Compression(e.to_string()))?;
-                
-                return Ok(Some(ChunkInfo {
-                    hash: stored_hash,
-                    fast_hash,
-                    size: size as usize,
-                    compressed_size: compressed_size as usize,
-                    compression,
-                    volume: volume as u64,
-                    offset: offset as u64,
-                }));
-            }
-        }
+        let hash_id: i64 = conn.query_row(
+            "SELECT id FROM hash_algorithms WHERE name = ?",
+            [config.hash_algorithm.to_string()],
+            |row| row.get(0)
+        )?;
         
-        Ok(None)
+        conn.execute("DELETE FROM archive_config WHERE id = 1", [])?;
+        
+        conn.execute(
+            "INSERT INTO archive_config (id, chunk_size, compression_id, compression_level, hash_id, created_at, version)
+             VALUES (1, ?, ?, ?, ?, ?, ?)",
+            params![
+                config.chunk_size as i64,
+                compression_id,
+                config.compression_level,
+                hash_id,
+                config.created_at,
+                config.version,
+            ],
+        )?;
+        
+        Ok(())
     }
 
-    /// Get chunk info by hash (assumes hash exists)
-    fn get_chunk_info_by_hash(&self, hash: &[u8]) -> Result<Option<ChunkInfo>> {
+    /// Load archive configuration
+    pub fn load_config(&self) -> Result<Option<ArchiveConfig>> {
+        let conn = self.conn.lock().unwrap();
+        
+        let result: Option<(i64, i64, i32, i64, i64, i64)> = conn.query_row(
+            "SELECT chunk_size, compression_id, compression_level, hash_id, created_at, version
+             FROM archive_config WHERE id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            }
+        ).optional()?;
+        
+        if let Some((chunk_size, compression_id, compression_level, hash_id, created_at, version)) = result {
+            let compression_name: String = conn.query_row(
+                "SELECT name FROM compression_algorithms WHERE id = ?",
+                [compression_id],
+                |row| row.get(0)
+            )?;
+            
+            let hash_name: String = conn.query_row(
+                "SELECT name FROM hash_algorithms WHERE id = ?",
+                [hash_id],
+                |row| row.get(0)
+            )?;
+            
+            let config = ArchiveConfig {
+                chunk_size: chunk_size as usize,
+                compression: CompressionAlgorithm::from_str(&compression_name)
+                    .map_err(|e| TemsError::Compression(e.to_string()))?,
+                compression_level,
+                hash_algorithm: HashAlgorithm::from_str(&hash_name)
+                    .map_err(|e| TemsError::Hash(e.to_string()))?,
+                created_at,
+                version: version as u32,
+            };
+            
+            Ok(Some(config))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Find chunk by hash
+    pub fn find_chunk(&self, hash: &str) -> Result<Option<ChunkInfo>> {
         let conn = self.conn.lock().unwrap();
         
         let mut stmt = conn.prepare(
             "SELECT c.hash, c.fast_hash, c.size, c.compressed_size, ca.name,
-                    c.volume_number, c.offset, c.reference_count
+                    c.volume_number, c.offset
              FROM chunks c
              JOIN compression_algorithms ca ON c.compression_id = ca.id
              WHERE c.hash = ?"
@@ -381,18 +309,15 @@ impl Database {
             let compressed_size: i64 = row.get(3)?;
             let volume: i64 = row.get(5)?;
             let offset: i64 = row.get(6)?;
-            
-            // Convertir le nom de compression en enum
             let compression_name: String = row.get(4)?;
-            let compression = CompressionAlgorithm::from_str(&compression_name)
-                .map_err(|e| TemsError::Compression(e.to_string()))?;
             
             Ok(Some(ChunkInfo {
                 hash: row.get(0)?,
                 fast_hash: fast_hash as u64,
                 size: size as usize,
                 compressed_size: compressed_size as usize,
-                compression,
+                compression: CompressionAlgorithm::from_str(&compression_name)
+                    .map_err(|e| TemsError::Compression(e.to_string()))?,
                 volume: volume as u64,
                 offset: offset as u64,
             }))
@@ -401,9 +326,8 @@ impl Database {
         }
     }
 
-    /// Find chunk ID by hash (fast version, doesn't keep lock)
-    pub fn find_chunk_id(&self, hash: &[u8], fast_hash: u64) -> Result<Option<i64>> {
-        // Prendre le lock uniquement pour cette requête
+    /// Find chunk ID by fast_hash and hash
+    pub fn find_chunk_id(&self, hash: &str, fast_hash: u64) -> Result<Option<i64>> {
         let conn = self.conn.lock().unwrap();
         
         let mut stmt = conn.prepare(
@@ -413,102 +337,47 @@ impl Database {
         let mut rows = stmt.query(params![fast_hash as i64, hash])?;
         
         if let Some(row) = rows.next()? {
-            let id: i64 = row.get(0)?;
-            Ok(Some(id))
+            Ok(Some(row.get(0)?))
         } else {
             Ok(None)
         }
     }
 
-    /// Insert chunk or get existing ID (handles duplicates gracefully)
-    pub fn insert_chunk_or_get_id(&self, chunk: &ChunkInfo) -> Result<i64> {
+    /// Insert new chunk
+    pub fn insert_chunk(&self, chunk: &ChunkInfo) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         
-        // Récupérer l'ID de l'algorithme de compression
         let compression_id: i64 = conn.query_row(
             "SELECT id FROM compression_algorithms WHERE name = ?",
             [chunk.compression.to_string()],
             |row| row.get(0)
         )?;
         
-        // Pour fast_hash, utiliser conversion sécurisée
-        let fast_hash = if chunk.fast_hash > i64::MAX as u64 {
-            (chunk.fast_hash & i64::MAX as u64) as i64
-        } else {
-            chunk.fast_hash as i64
-        };
-        
-        let size = chunk.size as i64;
-        let compressed_size = chunk.compressed_size as i64;
-        let volume = chunk.volume as i64;
-        let offset = chunk.offset as i64;
-        
-        // Essayer d'insérer, ignorer si déjà existant
         conn.execute(
-            "INSERT OR IGNORE INTO chunks 
+            "INSERT INTO chunks 
              (hash, fast_hash, size, compressed_size, compression_id, 
               volume_number, offset, reference_count)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
             params![
                 &chunk.hash,
-                fast_hash,
-                size,
-                compressed_size,
+                chunk.fast_hash as i64,
+                chunk.size as i64,
+                chunk.compressed_size as i64,
                 compression_id,
-                volume,
-                offset,
-                1
+                chunk.volume as i64,
+                chunk.offset as i64,
             ],
         )?;
-        
-        // Récupérer l'ID (existant ou nouvellement inséré)
-        let id: i64 = conn.query_row(
-            "SELECT id FROM chunks WHERE hash = ?",
-            [&chunk.hash],
-            |row| row.get(0)
-        )?;
-        
-        // Mettre à jour le cache
-        {
-            let mut cache = self.hash_cache.lock().unwrap();
-            cache.put(chunk.fast_hash, chunk.hash.clone());
-        }
-        
-        Ok(id)
-    }
 
-    /// Get chunk ID by hash (uses cache if available)
-    pub fn get_chunk_id_by_hash(&self, hash: &[u8]) -> Result<Option<i64>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT id FROM chunks WHERE hash = ?")?;
-        let mut rows = stmt.query([hash])?;
-        
-        if let Some(row) = rows.next()? {
-            let id: i64 = row.get(0)?;
-            Ok(Some(id))
-        } else {
-            Ok(None)
-        }
+        Ok(conn.last_insert_rowid())
     }
 
     /// Increment chunk reference count
-    pub fn increment_refcount(&self, hash: &[u8]) -> Result<()> {
+    pub fn increment_refcount(&self, hash: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         
         conn.execute(
             "UPDATE chunks SET reference_count = reference_count + 1 WHERE hash = ?",
-            [hash],
-        )?;
-        
-        Ok(())
-    }
-
-    /// Decrement chunk reference count (for GC)
-    pub fn decrement_refcount(&self, hash: &[u8]) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        
-        conn.execute(
-            "UPDATE chunks SET reference_count = reference_count - 1 WHERE hash = ?",
             [hash],
         )?;
         
@@ -525,7 +394,6 @@ impl Database {
             t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
         );
 
-        // Check that size doesn't exceed i64::MAX
         let size = if file.size > i64::MAX as u64 {
             i64::MAX
         } else {
@@ -554,25 +422,22 @@ impl Database {
     }
 
     /// Link chunks to file
-    pub fn link_chunks(&self, file_id: i64, chunk_ids: &[(i64, usize)]) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+pub fn link_chunks(&self, file_id: i64, chunk_ids: &[(i64, usize)]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();  // ← ajout de 'mut'
         
-        let mut conn = conn;
         let tx = conn.transaction()?;
         
         for (seq, (chunk_id, offset)) in chunk_ids.iter().enumerate() {
-            let offset_i64 = *offset as i64;
             tx.execute(
                 "INSERT INTO file_chunks (file_id, chunk_id, sequence, offset_in_file)
                  VALUES (?, ?, ?, ?)",
-                params![file_id, chunk_id, seq as i64, offset_i64],
+                params![file_id, chunk_id, seq as i64, *offset as i64],
             )?;
         }
         
         tx.commit()?;
         Ok(())
     }
-
     /// Get file history
     pub fn get_file_history(&self, path: &str) -> Result<Vec<(i64, u64, i64)>> {
         let conn = self.conn.lock().unwrap();
@@ -595,76 +460,20 @@ impl Database {
         Ok(versions)
     }
 
-    /// Find volume with free space
-    pub fn find_volume_with_space(&self, needed: u64) -> Result<Option<(u64, String, u64)>> {
-        let conn = self.conn.lock().unwrap();
-        
-        if needed > i64::MAX as u64 {
-            return Ok(None);
-        }
-        
-        let needed_i64 = needed as i64;
-        
-        let mut stmt = conn.prepare(
-            "SELECT number, filename, free_space FROM volumes 
-             WHERE status = 'active' AND free_space >= ? 
-             ORDER BY free_space DESC LIMIT 1"
-        )?;
-
-        let mut rows = stmt.query([needed_i64])?;
-        
-        if let Some(row) = rows.next()? {
-            let number: i64 = row.get(0)?;
-            let free_space: i64 = row.get(2)?;
-            Ok(Some((number as u64, row.get(1)?, free_space as u64)))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Create new volume with improved lock handling
+    /// Create new volume
     pub fn create_volume(&self, number: u64, filename: &str, size: u64, max_size: Option<u64>) -> Result<()> {
-        log::debug!("Attempting to lock connection for volume {} creation", number);
-        
-        // Essayer d'abord avec try_lock pour éviter les blocages
-        let conn = match self.conn.try_lock() {
-            Ok(guard) => {
-                log::debug!("Connection locked successfully for volume {}", number);
-                guard
-            }
-            Err(std::sync::TryLockError::WouldBlock) => {
-                log::warn!("Connection is busy for volume {}, waiting...", number);
-                // Si le lock est pris, on attend
-                self.conn.lock().unwrap()
-            }
-            Err(e) => {
-                log::error!("Failed to lock connection for volume {}: {:?}", number, e);
-                return Err(TemsError::Database(rusqlite::Error::SqliteFailure(
-                    rusqlite::ffi::Error::new(5),  // SQLITE_BUSY
-                    Some(format!("Database is locked: {:?}", e))
-                )).into());
-            }
-        };
-        
-        log::debug!("Creating volume {} in database", number);
+        let conn = self.conn.lock().unwrap();
         
         let number_i64 = number as i64;
         let size_i64 = if size > i64::MAX as u64 { i64::MAX } else { size as i64 };
         let max_size_i64 = max_size.map(|s| if s > i64::MAX as u64 { i64::MAX } else { s as i64 });
         
-        // Vérifier si le volume existe déjà
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM volumes WHERE number = ?)",
-            [number_i64],
-            |row| row.get(0)
-        ).unwrap_or(false);
+        let free_space = max_size.map_or(size_i64, |m| {
+            let m_i64 = if m > i64::MAX as u64 { i64::MAX } else { m as i64 };
+            m_i64 - size_i64
+        });
         
-        if exists {
-            log::warn!("Volume {} already exists in database, skipping insertion", number);
-            return Ok(());
-        }
-        
-        match conn.execute(
+        conn.execute(
             "INSERT INTO volumes (number, filename, size, max_size, free_space, status)
              VALUES (?, ?, ?, ?, ?, 'active')",
             params![
@@ -672,37 +481,122 @@ impl Database {
                 filename,
                 size_i64,
                 max_size_i64,
-                size_i64,
+                free_space,
             ],
-        ) {
-            Ok(rows) => {
-                log::debug!("Volume {} created in database ({} rows affected)", number, rows);
-                Ok(())
-            }
-            Err(e) => {
-                log::error!("Failed to insert volume {}: {}", number, e);
-                Err(TemsError::Database(e))
-            }
-        }
-    }
-
-    /// Update volume free space
-    pub fn update_volume_free_space(&self, volume: u64, used: u64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        
-        let volume_i64 = volume as i64;
-        let used_i64 = if used > i64::MAX as u64 { i64::MAX } else { used as i64 };
-        
-        conn.execute(
-            "UPDATE volumes SET free_space = free_space - ? WHERE number = ?",
-            params![used_i64, volume_i64],
         )?;
         
         Ok(())
     }
 
-    /// Get orphaned chunks (reference_count = 0)
-    pub fn get_orphaned_chunks(&self) -> Result<Vec<(Vec<u8>, u64, u64)>> {
+    /// Update volume size
+    pub fn update_volume_size(&self, volume: u64, written: u64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        
+        let volume_i64 = volume as i64;
+        let written_i64 = if written > i64::MAX as u64 { i64::MAX } else { written as i64 };
+        
+        conn.execute(
+            "UPDATE volumes 
+             SET size = size + ?, 
+                 free_space = free_space - ?,
+                 status = CASE 
+                     WHEN free_space - ? <= 0 THEN 'full'
+                     ELSE status
+                 END
+             WHERE number = ?",
+            params![written_i64, written_i64, written_i64, volume_i64],
+        )?;
+        
+        Ok(())
+    }
+
+    /// Get all volumes
+    pub fn get_all_volumes(&self) -> Result<Vec<(u64, String, u64, u64, Option<u64>, String)>> {
+        let conn = self.conn.lock().unwrap();
+        
+        let mut stmt = conn.prepare(
+            "SELECT number, filename, size, free_space, max_size, status 
+             FROM volumes ORDER BY number"
+        )?;
+        
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)? as u64,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as u64,
+                row.get::<_, i64>(3)? as u64,
+                row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        
+        let mut volumes = Vec::new();
+        for row in rows {
+            volumes.push(row?);
+        }
+        
+        Ok(volumes)
+    }
+
+    /// Get database stats
+    pub fn get_stats(&self) -> Result<std::collections::HashMap<String, String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stats = std::collections::HashMap::new();
+
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM current_files",
+            [],
+            |r| r.get(0)
+        ).unwrap_or(0);
+        stats.insert("files".to_string(), count.to_string());
+
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM chunks",
+            [],
+            |r| r.get(0)
+        ).unwrap_or(0);
+        stats.insert("chunks".to_string(), count.to_string());
+
+        let size: i64 = conn.query_row(
+            "SELECT SUM(size) FROM chunks",
+            [],
+            |r| r.get(0)
+        ).unwrap_or(0);
+        stats.insert("unique_size".to_string(), size.to_string());
+
+        let size: i64 = conn.query_row(
+            "SELECT SUM(compressed_size) FROM chunks",
+            [],
+            |r| r.get(0)
+        ).unwrap_or(0);
+        stats.insert("stored_size".to_string(), size.to_string());
+
+        let total_size: i64 = conn.query_row(
+            "SELECT SUM(f.size) FROM current_files f",
+            [],
+            |r| r.get(0)
+        ).unwrap_or(0);
+        stats.insert("total_size".to_string(), total_size.to_string());
+
+        Ok(stats)
+    }
+
+    /// Integrity check
+    pub fn integrity_check(&self) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let result: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        Ok(result == "ok")
+    }
+
+    /// Vacuum database
+    pub fn vacuum(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("VACUUM", [])?;
+        Ok(())
+    }
+
+    /// Get orphaned chunks
+    pub fn get_orphaned_chunks(&self) -> Result<Vec<(String, u64, u64)>> {
         let conn = self.conn.lock().unwrap();
         
         let mut stmt = conn.prepare(
@@ -734,106 +628,6 @@ impl Database {
         )?;
         
         Ok(deleted)
-    }
-
-    /// Vacuum database (optimize)
-    pub fn vacuum(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        // VACUUM retourne un résultat, donc on utilise query_row
-        let _: i32 = conn.query_row("VACUUM", [], |row| row.get(0))?;
-        Ok(())
-    }
-
-    /// Integrity check
-    pub fn integrity_check(&self) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
-        let result: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
-        Ok(result == "ok")
-    }
-
-    /// Get database stats
-    pub fn get_stats(&self) -> Result<std::collections::HashMap<String, String>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stats = std::collections::HashMap::new();
-
-        // Total files
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM current_files",
-            [],
-            |r| r.get(0)
-        ).unwrap_or(0);
-        stats.insert("files".to_string(), count.to_string());
-
-        // Total chunks
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM chunks",
-            [],
-            |r| r.get(0)
-        ).unwrap_or(0);
-        stats.insert("chunks".to_string(), count.to_string());
-
-        // Total unique data size
-        let size: i64 = conn.query_row(
-            "SELECT SUM(size) FROM chunks",
-            [],
-            |r| r.get(0)
-        ).unwrap_or(0);
-        stats.insert("unique_size".to_string(), size.to_string());
-
-        // Total stored size (compressed)
-        let size: i64 = conn.query_row(
-            "SELECT SUM(compressed_size) FROM chunks",
-            [],
-            |r| r.get(0)
-        ).unwrap_or(0);
-        stats.insert("stored_size".to_string(), size.to_string());
-
-        // Total size of all files
-        let total_size: i64 = conn.query_row(
-            "SELECT SUM(f.size) FROM current_files f",
-            [],
-            |r| r.get(0)
-        ).unwrap_or(0);
-        stats.insert("total_size".to_string(), total_size.to_string());
-
-        // Cache stats
-        let db_stats = self.stats.lock().unwrap();
-        stats.insert("cache_hits".to_string(), db_stats.cache_hits.to_string());
-        stats.insert("cache_misses".to_string(), db_stats.cache_misses.to_string());
-        stats.insert("cache_hit_ratio".to_string(), 
-            format!("{:.2}%", 
-                if db_stats.total_queries > 0 {
-                    (db_stats.cache_hits as f64 / db_stats.total_queries as f64) * 100.0
-                } else {
-                    0.0
-                }
-            )
-        );
-        
-        if !db_stats.query_times_ms.is_empty() {
-            let avg_time: f64 = db_stats.query_times_ms.iter().sum::<f64>() / db_stats.query_times_ms.len() as f64;
-            stats.insert("avg_query_time_ms".to_string(), format!("{:.3}", avg_time));
-        }
-
-        Ok(stats)
-    }
-}
-
-// Implement conversion for compression algorithm
-impl ToSql for CompressionAlgorithm {
-    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
-        Ok(self.to_string().into())
-    }
-}
-
-impl FromSql for CompressionAlgorithm {
-    fn column_result(value: ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
-        value.as_str().map(|s| match s {
-            "zstd" => CompressionAlgorithm::Zstd,
-            "xz" => CompressionAlgorithm::Xz,
-            "none" => CompressionAlgorithm::None,
-            _ => CompressionAlgorithm::None,
-        })
     }
 }
 

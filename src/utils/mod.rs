@@ -55,6 +55,20 @@ pub fn parse_duration(duration_str: &str) -> Result<u64> {
     }
 }
 
+/// Format size in human-readable form
+pub fn format_size(size: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut size = size as f64;
+    let mut unit = 0;
+    
+    while size >= 1024.0 && unit < 4 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    
+    format!("{:.2} {}", size, UNITS[unit])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

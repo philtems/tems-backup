@@ -1,13 +1,13 @@
 [package]
 name = "tems-backup"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Philippe TEMESI <philippe@tems.be>"]
 description = "Advanced backup tool with deduplication and versioning"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/tems-be/tems-backup"
 homepage = "https://www.tems.be"
-keywords = ["backup", "deduplication", "archive", "compression"]
+keywords = ["backup", "deduplication", "archive", "compression", "remote"]
 categories = ["command-line-utilities", "compression"]
 readme = "README.md"
 
@@ -28,24 +28,22 @@ thiserror = "1.0"
 dialoguer = "0.11"
 console = "0.15"
 indicatif = "0.17"
+rpassword = "7.3"
+ssh2 = "0.9"
+openssl = { version = "0.10", features = ["vendored"] }
 
 # Database
 rusqlite = { version = "0.31", features = ["bundled", "trace", "blob", "series"] }
 
-# Compression (en option)
+# Compression (optional)
 zstd = { version = "0.13", optional = true }
 xz2 = { version = "0.1", optional = true }
 
-# Hashing (en option)
+# Hashing (optional)
 blake3 = { version = "1.5", optional = true }
 xxhash-rust = { version = "0.8", features = ["xxh3"], optional = true }
 sha2 = { version = "0.10", optional = true }
 hex = "0.4"
-
-# Concurrency and parallelism
-rayon = "1.8"
-tokio = { version = "1.36", features = ["rt", "macros"] }
-futures = "0.3"
 
 # File operations
 walkdir = "2"
@@ -78,7 +76,6 @@ env_logger = "0.11"
 
 # System information
 sysinfo = "0.30"
-num_cpus = "1.16"
 
 # Regular expressions for pattern matching
 regex = "1.10"
@@ -96,9 +93,9 @@ derive_more = "0.99"
 # For build info
 rustc_version_runtime = "0.3"
 
-# OPTIMISATIONS DATABASE (en option - bloom filter retiré pour l'instant)
-lru = { version = "0.12", optional = true }
-memmap2 = { version = "0.9", optional = true }
+# Remote support
+ureq = { version = "2.9", features = ["json", "charset"] }
+base64 = "0.22"
 
 # Platform-specific dependencies
 [target.'cfg(unix)'.dependencies]
@@ -130,7 +127,7 @@ test-case = "3.3"
 rustc_version = "0.4"
 
 [features]
-default = ["zstd", "blake3", "xxhash", "sha256", "xz", "cache"]
+default = ["full"]
 
 # Compression features
 zstd = ["dep:zstd"]
@@ -141,13 +138,10 @@ blake3 = ["dep:blake3"]
 xxhash = ["dep:xxhash-rust"]
 sha256 = ["dep:sha2"]
 
-# Optimisation features (sans bloom)
-cache = ["dep:lru", "dep:memmap2"]
-
 # All features
-full = ["zstd", "xz", "blake3", "xxhash", "sha256", "cache"]
+full = ["zstd", "xz", "blake3", "xxhash", "sha256"]
 
-# Platform-specific features (just for information)
+# Platform-specific features
 unix = []
 windows = []
 

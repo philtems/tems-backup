@@ -47,7 +47,6 @@ pub fn execute(args: LogArgs, _config: &crate::utils::config::Config) -> Result<
                 .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
                 .unwrap_or_else(|| "unknown".to_string());
 
-            // Action would be determined from database
             let action = if version == 1 { "created" } else { "modified" };
 
             println!("v{:<5}  {}  {:<10}  {}", version, date, "-", action);
