@@ -25,7 +25,6 @@ impl SftpStorage {
         session.set_tcp_stream(tcp);
         session.handshake()?;
         
-        // Authentification
         if let Some(key_file) = &auth.key_file {
             session.userauth_pubkey_file(
                 &auth.username,
@@ -59,7 +58,7 @@ impl SftpStorage {
     fn ensure_parent_dir(&self, sftp: &ssh2::Sftp, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                let _ = sftp.mkdir(parent, 0o755); // Ignore error if exists
+                let _ = sftp.mkdir(parent, 0o755);
             }
         }
         Ok(())
@@ -101,6 +100,16 @@ impl RemoteStorage for SftpStorage {
         Ok(sftp.stat(&full_path).is_ok())
     }
     
+    fn get_size(&self, remote_path: &Path) -> Result<u64> {
+        let sftp = self.sftp()?;
+        let full_path = self.base_path.join(remote_path);
+        
+        match sftp.stat(&full_path) {
+            Ok(stat) => Ok(stat.size.unwrap_or(0)),
+            Err(e) => Err(anyhow!("Failed to get file size: {}", e)),
+        }
+    }
+    
     fn create_dir(&self, remote_path: &Path) -> Result<()> {
         let sftp = self.sftp()?;
         let full_path = self.base_path.join(remote_path);
@@ -139,7 +148,6 @@ impl RemoteStorage for SftpStorage {
     }
     
     fn clone_box(&self) -> Box<dyn RemoteStorage> {
-        // On crée une nouvelle connexion avec les mêmes paramètres
         match SftpStorage::new(
             self.location.clone(),
             self.auth.clone(),
@@ -147,7 +155,6 @@ impl RemoteStorage for SftpStorage {
         ) {
             Ok(storage) => Box::new(storage),
             Err(e) => {
-                // En cas d'erreur, on log et on panique avec un message clair
                 panic!("Failed to clone SftpStorage: {}", e);
             }
         }

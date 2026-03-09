@@ -112,6 +112,25 @@ impl RemoteStorage for WebdavStorage {
             Err(e) => Err(anyhow!("Failed to check existence: {}", e)),
         }
     }
+    
+    fn get_size(&self, remote_path: &Path) -> Result<u64> {
+        let url = self.build_url(remote_path);
+        
+        let agent = ureq::agent();
+        let request = agent.head(&url);
+        let request = self.add_auth_header(request);
+        
+        match request.call() {
+            Ok(response) => {
+                if let Some(content_length) = response.header("Content-Length") {
+                    Ok(content_length.parse::<u64>()?)
+                } else {
+                    Err(anyhow!("No Content-Length header"))
+                }
+            }
+            Err(e) => Err(anyhow!("Failed to get file size: {}", e)),
+        }
+    }
 
     fn create_dir(&self, remote_path: &Path) -> Result<()> {
         let url = self.build_url(remote_path);

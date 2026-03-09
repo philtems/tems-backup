@@ -8,7 +8,7 @@ use crate::VOLUME_NUMBER_DIGITS;
 use std::collections::HashMap;
 use crate::storage::database::Database;
 use log::{info, debug, warn};
-use crate::remote::RemoteStorage;
+use crate::remote::{RemoteStorage, upload_with_retry};
 
 #[derive(Debug, Clone)]
 pub struct VolumeInfo {
@@ -244,9 +244,10 @@ impl VolumeManager {
                     // Créer le répertoire distant si nécessaire
                     storage.create_dir(remote_dir)?;
                     
-                    match storage.upload_file(&vol.path, &remote_path) {
+                    // Upload avec retry et vérification (max 3 tentatives, 60s entre chaque)
+                    match upload_with_retry(storage.as_ref(), &vol.path, &remote_path, 3, 60) {
                         Ok(_) => {
-                            println!("✅ Volume {} uploaded successfully", volume);
+                            println!("✅ Volume {} uploaded and verified successfully", volume);
                             
                             if !self.keep_volumes {
                                 match std::fs::remove_file(&vol.path) {
@@ -256,8 +257,9 @@ impl VolumeManager {
                             }
                         }
                         Err(e) => {
-                            eprintln!("❌ FAILED to upload volume {}: {}", volume, e);
+                            eprintln!("❌ FAILED to upload volume {} after multiple retries: {}", volume, e);
                             eprintln!("   Volume remains LOCAL - server may be incomplete!");
+                            eprintln!("   Please check your connection and try again.");
                         }
                     }
                 }

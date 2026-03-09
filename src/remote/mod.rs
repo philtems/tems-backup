@@ -3,6 +3,8 @@
 use anyhow::{Result, anyhow};
 use std::path::{Path, PathBuf};
 use std::fmt;
+use std::thread;
+use std::time::Duration;
 
 // Importer les modules
 mod sftp;
@@ -165,6 +167,7 @@ pub trait RemoteStorage: Send + Sync {
     fn create_dir(&self, remote_path: &Path) -> Result<()>;
     fn list_files(&self, remote_path: &Path) -> Result<Vec<String>>;
     fn delete_file(&self, remote_path: &Path) -> Result<()>;
+    fn get_size(&self, remote_path: &Path) -> Result<u64>;  // ← NOUVEAU
     fn clone_box(&self) -> Box<dyn RemoteStorage>;
 }
 
@@ -172,6 +175,50 @@ impl Clone for Box<dyn RemoteStorage> {
     fn clone(&self) -> Self {
         self.clone_box()
     }
+}
+
+/// Upload a file with retry and verification
+pub fn upload_with_retry(
+    storage: &dyn RemoteStorage,
+    local_path: &Path,
+    remote_path: &Path,
+    max_retries: usize,
+    delay_seconds: u64,
+) -> Result<()> {
+    let local_size = std::fs::metadata(local_path)?.len();
+    
+    for attempt in 1..=max_retries {
+        println!("📤 Upload attempt {}/{} for {}", attempt, max_retries, remote_path.display());
+        
+        match storage.upload_file(local_path, remote_path) {
+            Ok(()) => {
+                // Vérifier la taille après upload
+                match storage.get_size(remote_path) {
+                    Ok(remote_size) => {
+                        if remote_size == local_size {
+                            println!("✅ Upload successful and verified ({} bytes)", local_size);
+                            return Ok(());
+                        } else {
+                            eprintln!("❌ Size mismatch: remote {} vs local {}", remote_size, local_size);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️  Could not verify upload size: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("❌ Upload attempt {} failed: {}", attempt, e);
+            }
+        }
+        
+        if attempt < max_retries {
+            println!("⏳ Waiting {} seconds before retry...", delay_seconds);
+            thread::sleep(Duration::from_secs(delay_seconds));
+        }
+    }
+    
+    Err(anyhow!("Failed to upload after {} attempts", max_retries))
 }
 
 pub fn create_remote_storage(
