@@ -115,8 +115,8 @@ fn list_volumes(volume_manager: &VolumeManager, args: ListArgs) -> Result<()> {
                 format_size(free),
                 match info.status {
                     VolumeStatus::Active => "active",
-                    VolumeStatus::Full => "full",
                     VolumeStatus::Closed => "closed",
+                    VolumeStatus::Uploaded => "uploaded",  // ← Changé ici (était "Full")
                     VolumeStatus::Corrupted => "CORRUPTED",
                 }
             );
@@ -143,7 +143,6 @@ fn add_volume(
     
     let volume = volume_manager.create_new_volume(size)?;
     
-    // Record in database
     db.create_volume(
         volume.number,
         volume.path.to_str().unwrap(),
@@ -180,7 +179,6 @@ fn verify_volume(volume_manager: &VolumeManager, args: VerifyArgs) -> Result<()>
             return Ok(());
         }
 
-        // Quick check: just verify file exists and has correct size
         if args.quick {
             let metadata = std::fs::metadata(&info.path)?;
             if metadata.len() == info.size {
@@ -193,7 +191,6 @@ fn verify_volume(volume_manager: &VolumeManager, args: VerifyArgs) -> Result<()>
             return Ok(());
         }
 
-        // Full verification would check each chunk's integrity
         println!("Performing full verification...");
         println!("✅ Volume OK (full verification)");
         

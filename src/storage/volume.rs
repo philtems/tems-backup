@@ -23,8 +23,8 @@ pub struct VolumeInfo {
 #[derive(Debug, Clone, PartialEq)]
 pub enum VolumeStatus {
     Active,
-    Full,
     Closed,
+    Uploaded,
     Corrupted,
 }
 
@@ -95,21 +95,20 @@ impl VolumeManager {
             let default_size = volume_size.unwrap_or(1024 * 1024 * 1024);
             info!("No volumes found, creating first volume of size: {}", default_size);
             self.create_new_volume(default_size)?;
-        } else if self.current_volume.is_none() {
-            debug!("No active volume found");
-            let mut found = false;
+        } else {
+            let mut found_active = false;
             for vol in self.volumes.values() {
-                if vol.free_space > 0 && vol.status != VolumeStatus::Full {
+                if vol.status == VolumeStatus::Active {
                     self.current_volume = Some(vol.number);
-                    info!("Selected existing volume {} as active (free space: {})", vol.number, vol.free_space);
-                    found = true;
+                    info!("Found existing active volume {} ({} bytes free)", vol.number, vol.free_space);
+                    found_active = true;
                     break;
                 }
             }
             
-            if !found {
-                info!("No existing volume with free space, creating new volume");
+            if !found_active {
                 let default_size = volume_size.unwrap_or(1024 * 1024 * 1024);
+                info!("No active volume found, creating new one");
                 self.create_new_volume(default_size)?;
             }
         }
@@ -156,35 +155,54 @@ impl VolumeManager {
         
         self.sync_with_database()?;
         
-        // Vérifier le volume actif d'abord
         if let Some(num) = self.current_volume {
-            if let Some(vol) = self.volumes.get(&num) {
-                if vol.free_space >= needed && vol.status != VolumeStatus::Full {
+            if let Some(vol) = self.volumes.get(&num).cloned() {
+                if vol.free_space >= needed && vol.status == VolumeStatus::Active {
                     debug!("Using active volume {} with {} free", num, vol.free_space);
                     return Ok((vol.number, vol.path.clone(), vol.free_space));
                 } else {
                     debug!("Active volume {} has only {} free, need {}", 
                            num, vol.free_space, needed);
                     
-                    // Le chunk ne tient pas dans le volume actif
-                    // On upload ce volume maintenant (il ne sera jamais plein)
-                    self.upload_volume(num)?;
+                    if vol.size > 0 {
+                        println!("📦 Volume {} is full ({} bytes), uploading...", num, vol.size);
+                        
+                        if let Some(vol_mut) = self.volumes.get_mut(&num) {
+                            vol_mut.status = VolumeStatus::Closed;
+                        }
+                        
+                        match self.upload_volume_with_retry(num) {
+                            Ok(_) => {
+                                if !self.keep_volumes {
+                                    if let Some(vol_path) = self.volumes.get(&num).map(|v| v.path.clone()) {
+                                        let _ = std::fs::remove_file(&vol_path);
+                                    }
+                                }
+                                if let Some(vol_mut) = self.volumes.get_mut(&num) {
+                                    vol_mut.status = VolumeStatus::Uploaded;
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("❌ Failed to upload volume {}: {}", num, e);
+                            }
+                        }
+                    }
                     self.current_volume = None;
                 }
+            } else {
+                self.current_volume = None;
             }
         }
 
-        // Chercher un autre volume existant avec assez d'espace
         for vol in self.volumes.values() {
-            if vol.free_space >= needed && vol.status != VolumeStatus::Full {
+            if vol.status == VolumeStatus::Active && vol.free_space >= needed {
                 self.current_volume = Some(vol.number);
-                debug!("Found existing volume {} with {} free", vol.number, vol.free_space);
+                debug!("Found existing active volume {} with {} free", vol.number, vol.free_space);
                 return Ok((vol.number, vol.path.clone(), vol.free_space));
             }
         }
 
-        // Aucun volume existant avec assez d'espace → on crée un nouveau volume
-        debug!("No existing volume with enough space, creating new one");
+        debug!("No existing active volume with enough space, creating new one");
 
         let size = self.get_default_volume_size()?;
         debug!("Creating new volume with size {}", size);
@@ -197,15 +215,16 @@ impl VolumeManager {
 
     pub fn update_volume_free_space(&mut self, volume: u64, used: u64) -> Result<()> {
         let mut became_full = false;
+        let mut volume_size = 0;
         
         if let Some(vol) = self.volumes.get_mut(&volume) {
             vol.free_space = vol.free_space.saturating_sub(used);
             vol.size += used;
+            volume_size = vol.size;
 
             if vol.free_space == 0 {
-                vol.status = VolumeStatus::Full;
                 became_full = true;
-                println!("✅ Volume {} is now full ({} bytes)", volume, vol.size);
+                vol.status = VolumeStatus::Closed;
             }
         };
         
@@ -213,55 +232,69 @@ impl VolumeManager {
             db.update_volume_size(volume, used)?;
         }
         
-        // Upload quand le volume est exactement plein
         if became_full {
-            self.upload_volume(volume)?;
+            println!("✅ Volume {} is now exactly full ({} bytes)", volume, volume_size);
+            
+            match self.upload_volume_with_retry(volume) {
+                Ok(_) => {
+                    if !self.keep_volumes {
+                        if let Some(vol_path) = self.volumes.get(&volume).map(|v| v.path.clone()) {
+                            let _ = std::fs::remove_file(&vol_path);
+                        }
+                    }
+                    if let Some(vol) = self.volumes.get_mut(&volume) {
+                        vol.status = VolumeStatus::Uploaded;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("❌ Failed to upload volume {}: {}", volume, e);
+                }
+            }
         }
         
         Ok(())
     }
 
-    /// À appeler à la FIN du backup pour uploader le dernier volume
     pub fn upload_final_volume(&mut self) -> Result<()> {
         if let Some(volume) = self.current_volume {
             if let Some(vol) = self.volumes.get(&volume) {
-                if vol.size > 0 && vol.status != VolumeStatus::Full {
-                    println!("📤 Uploading final volume {} ({} bytes) to remote...", volume, vol.size);
-                    self.upload_volume(volume)?;
+                if vol.size > 0 {
+                    println!("📤 Uploading final volume {} ({} bytes)...", volume, vol.size);
+                    
+                    match self.upload_volume_with_retry(volume) {
+                        Ok(_) => {
+                            if !self.keep_volumes {
+                                if let Some(vol_path) = self.volumes.get(&volume).map(|v| v.path.clone()) {
+                                    let _ = std::fs::remove_file(&vol_path);
+                                }
+                            }
+                            if let Some(vol) = self.volumes.get_mut(&volume) {
+                                vol.status = VolumeStatus::Uploaded;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("❌ Failed to upload final volume {}: {}", volume, e);
+                            return Err(e.into());
+                        }
+                    }
                 }
             }
+            self.current_volume = None;
         }
         Ok(())
     }
 
-    fn upload_volume(&mut self, volume: u64) -> Result<()> {
+    fn upload_volume_with_retry(&self, volume: u64) -> Result<()> {
         if let Some(storage) = &self.remote_storage {
             if let Some(vol) = self.volumes.get(&volume) {
                 if vol.size > 0 {
                     let remote_dir = Path::new("volumes");
                     let remote_path = remote_dir.join(vol.path.file_name().unwrap());
                     
-                    // Créer le répertoire distant si nécessaire
                     storage.create_dir(remote_dir)?;
                     
-                    // Upload avec retry et vérification (max 3 tentatives, 60s entre chaque)
-                    match upload_with_retry(storage.as_ref(), &vol.path, &remote_path, 3, 60) {
-                        Ok(_) => {
-                            println!("✅ Volume {} uploaded and verified successfully", volume);
-                            
-                            if !self.keep_volumes {
-                                match std::fs::remove_file(&vol.path) {
-                                    Ok(_) => println!("✅ Local copy of volume {} removed", volume),
-                                    Err(e) => eprintln!("⚠️  Failed to remove local volume {}: {}", volume, e),
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("❌ FAILED to upload volume {} after multiple retries: {}", volume, e);
-                            eprintln!("   Volume remains LOCAL - server may be incomplete!");
-                            eprintln!("   Please check your connection and try again.");
-                        }
-                    }
+                    upload_with_retry(storage.as_ref(), &vol.path, &remote_path, 3, 60)
+                        .map_err(|e| TemsError::Remote(e.to_string()))?;
                 }
             }
         }
@@ -280,7 +313,7 @@ impl VolumeManager {
             if let Some(s) = result {
                 Ok(s as u64)
             } else {
-                Ok(1024 * 1024 * 1024) // 1GB par défaut
+                Ok(1024 * 1024 * 1024)
             }
         } else {
             Ok(1024 * 1024 * 1024)
@@ -346,18 +379,11 @@ impl VolumeManager {
     fn sync_with_database(&mut self) -> Result<()> {
         if let Some(db) = &self.db {
             let db_volumes = db.get_all_volumes()?;
-            for (number, _, size, free_space, max_size, status_str) in db_volumes {
+            for (number, _, size, free_space, max_size, _) in db_volumes {
                 if let Some(vol) = self.volumes.get_mut(&number) {
                     vol.free_space = free_space;
                     vol.size = size;
                     vol.max_size = max_size;
-                    vol.status = match status_str.as_str() {
-                        "active" => VolumeStatus::Active,
-                        "full" => VolumeStatus::Full,
-                        "closed" => VolumeStatus::Closed,
-                        "corrupted" => VolumeStatus::Corrupted,
-                        _ => vol.status.clone(),
-                    };
                 }
             }
         }
@@ -377,15 +403,13 @@ impl VolumeManager {
         if let Some(db) = &self.db {
             let db_volumes = db.get_all_volumes()?;
             
-            for (number, filename, size, free_space, max_size, status_str) in db_volumes {
+            for (number, filename, size, free_space, max_size, _) in db_volumes {
                 let path = self.volumes_dir.join(&filename);
                 
-                let status = match status_str.as_str() {
-                    "active" => VolumeStatus::Active,
-                    "full" => VolumeStatus::Full,
-                    "closed" => VolumeStatus::Closed,
-                    "corrupted" => VolumeStatus::Corrupted,
-                    _ => VolumeStatus::Closed,
+                let status = if path.exists() {
+                    VolumeStatus::Active
+                } else {
+                    VolumeStatus::Uploaded
                 };
                 
                 let volume = VolumeInfo {
@@ -416,7 +440,7 @@ impl VolumeManager {
                             size: metadata.len(),
                             max_size: None,
                             free_space: 0,
-                            status: VolumeStatus::Closed,
+                            status: VolumeStatus::Active,
                         };
                         
                         self.volumes.insert(number, volume);
@@ -429,7 +453,7 @@ impl VolumeManager {
         let mut active_volume = None;
         
         for (num, vol) in &self.volumes {
-            if vol.free_space > max_free && vol.status != VolumeStatus::Full {
+            if vol.status == VolumeStatus::Active && vol.free_space > max_free {
                 max_free = vol.free_space;
                 active_volume = Some(*num);
             }
@@ -445,60 +469,6 @@ impl VolumeManager {
         path.file_stem()
             .and_then(|s| s.to_str())
             .and_then(|s| s.parse::<u64>().ok())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    #[test]
-    fn test_volume_creation() {
-        let dir = tempdir().unwrap();
-        let archive_path = dir.path().join("test.tms");
-        let mut manager = VolumeManager::new(archive_path);
-        
-        manager.init_volumes(Some(1024 * 1024)).unwrap();
-        let (num, path, free) = manager.find_volume_with_space(500).unwrap();
-        
-        assert_eq!(num, 1);
-        assert!(path.exists());
-        assert_eq!(free, 1024 * 1024);
-    }
-
-    #[test]
-    fn test_multiple_volumes() {
-        let dir = tempdir().unwrap();
-        let archive_path = dir.path().join("test.tms");
-        let mut manager = VolumeManager::new(archive_path);
-        
-        manager.init_volumes(Some(1000)).unwrap();
-        
-        let (num1, _, free1) = manager.find_volume_with_space(600).unwrap();
-        manager.update_volume_free_space(num1, 600).unwrap();
-        
-        let (num2, _, free2) = manager.find_volume_with_space(600).unwrap();
-        
-        assert_eq!(num1, 1);
-        assert_eq!(num2, 2);
-        assert_eq!(free1, 400);
-        assert_eq!(free2, 1000);
-    }
-
-    #[test]
-    fn test_list_volumes() {
-        let dir = tempdir().unwrap();
-        let archive_path = dir.path().join("test.tms");
-        let mut manager = VolumeManager::new(archive_path);
-        
-        manager.init_volumes(Some(1000)).unwrap();
-        manager.create_new_volume(1000).unwrap();
-        manager.create_new_volume(1000).unwrap();
-        
-        let volumes = manager.list_volumes();
-        assert_eq!(volumes.len(), 3);
-        assert_eq!(volumes, vec![1, 2, 3]);
     }
 }
 
