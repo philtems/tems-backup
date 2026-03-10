@@ -4,7 +4,6 @@ version = "0.2.0"
 edition = "2021"
 authors = ["Philippe TEMESI <philippe@tems.be>"]
 description = "Advanced backup tool with deduplication and versioning"
-license = "MIT OR Apache-2.0"
 repository = "https://github.com/tems-be/tems-backup"
 homepage = "https://www.tems.be"
 keywords = ["backup", "deduplication", "archive", "compression", "remote"]
@@ -24,16 +23,16 @@ incremental = true
 # CLI and user interaction
 clap = { version = "4.5", features = ["derive", "cargo", "wrap_help"] }
 anyhow = "1.0"
-thiserror = "1.0"
-dialoguer = "0.11"
-console = "0.15"
-indicatif = "0.17"
+thiserror = "2.0.18"
+dialoguer = "0.12.0"
+console = "0.16.2"
+indicatif = "0.18.4"
 rpassword = "7.3"
 ssh2 = "0.9"
 openssl = { version = "0.10", features = ["vendored"] }
 
 # Database
-rusqlite = { version = "0.31", features = ["bundled", "trace", "blob", "series"] }
+rusqlite = { version = "0.38.0", features = ["bundled", "trace", "blob", "series"] }
 
 # Compression (optional)
 zstd = { version = "0.13", optional = true }
@@ -49,22 +48,22 @@ hex = "0.4"
 walkdir = "2"
 ignore = "0.4"
 filetime = "0.2"
-remove_dir_all = "0.8"
+remove_dir_all = "1.0.0"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.8"
+toml = "1.0.6"
 
 # Path handling
 camino = { version = "1.1", features = ["serde1"] }
 path-clean = "1.0"
 
 # Cross-platform
-dirs = "5.0"
+dirs = "6.0.0"
 whoami = "1.4"
 normpath = "1.1"
-platform-info = "0.2"
+platform-info = "2.0.5"
 
 # Time and date
 chrono = "0.4"
@@ -75,7 +74,7 @@ log = "0.4"
 env_logger = "0.11"
 
 # System information
-sysinfo = "0.30"
+sysinfo = "0.38.4"
 
 # Regular expressions for pattern matching
 regex = "1.10"
@@ -88,7 +87,7 @@ atty = "0.2"
 termcolor = "1.4"
 
 # Error handling and utilities
-derive_more = "0.99"
+derive_more = { version = "2.1.1" , features = ["full"] }
 
 # For build info
 rustc_version_runtime = "0.3"
@@ -99,7 +98,7 @@ base64 = "0.22"
 
 # Platform-specific dependencies
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.28", features = ["fs", "user"] }
+nix = { version = "0.31.2", features = ["fs", "user"] }
 unix_mode = "0.1"
 users = "0.11"
 
@@ -114,13 +113,13 @@ winapi = { version = "0.3", features = [
     "handleapi",
     "errhandlingapi"
 ] }
-windows-sys = "0.52"
+windows-sys = "0.61.2"
 
 [dev-dependencies]
 tempfile = "3.9"
 assert_cmd = "2.0"
 predicates = "3.1"
-rstest = "0.19"
+rstest = "0.26.1"
 test-case = "3.3"
 
 [build-dependencies]
