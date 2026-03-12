@@ -2,13 +2,17 @@
 
 use std::path::{Path, PathBuf};
 use std::fs::File;
+use std::io::Write;
 use rusqlite::OptionalExtension;
 use crate::error::{Result, TemsError};
 use crate::VOLUME_NUMBER_DIGITS;
 use std::collections::HashMap;
 use crate::storage::database::Database;
-use log::{info, debug, warn};
+use log::{info, debug, warn, error};
 use crate::remote::{RemoteStorage, upload_with_retry};
+// use crate::constants;  // ← Import exactement comme le demande le compilateur
+
+const MAGIC_BYTES: &[u8; 8] = b"TEMSBKUP";
 
 #[derive(Debug, Clone)]
 pub struct VolumeInfo {
@@ -113,6 +117,12 @@ impl VolumeManager {
             }
         }
 
+        // Vérifier l'intégrité des volumes existants
+        let corrupted = self.verify_all_volumes()?;
+        if !corrupted.is_empty() {
+            warn!("Found {} corrupted volumes: {:?}", corrupted.len(), corrupted);
+        }
+
         Ok(())
     }
 
@@ -123,12 +133,14 @@ impl VolumeManager {
 
         info!("Creating new volume {} at {:?} with max size {}", number, path, max_size);
 
-        File::create(&path)?;
-        debug!("Volume file created");
+        // Écrire un header magique pour identification
+        let mut file = File::create(&path)?;
+        file.write_all(MAGIC_BYTES)?;
+        debug!("Volume file created with magic bytes");
 
         if let Some(db) = &self.db {
             debug!("Inserting volume {} into database", number);
-            db.create_volume(number, filename.as_str(), 0, Some(max_size))?;
+            db.create_volume(number, filename.as_str(), MAGIC_BYTES.len() as u64, Some(max_size))?;
             debug!("Volume inserted in database");
         } else {
             warn!("No database connection in VolumeManager");
@@ -137,9 +149,9 @@ impl VolumeManager {
         let volume = VolumeInfo {
             number,
             path: path.clone(),
-            size: 0,
+            size: MAGIC_BYTES.len() as u64,
             max_size: Some(max_size),
-            free_space: max_size,
+            free_space: max_size - (MAGIC_BYTES.len() as u64),
             status: VolumeStatus::Active,
         };
 
@@ -164,7 +176,7 @@ impl VolumeManager {
                     debug!("Active volume {} has only {} free, need {}", 
                            num, vol.free_space, needed);
                     
-                    if vol.size > 0 {
+                    if vol.size > MAGIC_BYTES.len() as u64 {
                         println!("📦 Volume {} is full ({} bytes), uploading...", num, vol.size);
                         
                         if let Some(vol_mut) = self.volumes.get_mut(&num) {
@@ -258,7 +270,7 @@ impl VolumeManager {
     pub fn upload_final_volume(&mut self) -> Result<()> {
         if let Some(volume) = self.current_volume {
             if let Some(vol) = self.volumes.get(&volume) {
-                if vol.size > 0 {
+                if vol.size > MAGIC_BYTES.len() as u64 {
                     println!("📤 Uploading final volume {} ({} bytes)...", volume, vol.size);
                     
                     match self.upload_volume_with_retry(volume) {
@@ -284,6 +296,107 @@ impl VolumeManager {
         Ok(())
     }
 
+    pub fn resume_failed_upload(&mut self, volume: u64) -> Result<()> {
+        if let Some(vol) = self.volumes.get(&volume) {
+            if vol.status == VolumeStatus::Closed {
+                info!("Resuming upload for volume {}", volume);
+                
+                // Vérifier si le volume est complet
+                if let Some(storage) = &self.remote_storage {
+                    let remote_path = Path::new("volumes").join(vol.path.file_name().unwrap());
+                    
+                    // Vérifier si le fichier existe déjà partiellement
+                    if storage.exists(&remote_path)? {
+                        let remote_size = storage.get_size(&remote_path)?;
+                        if remote_size == vol.size {
+                            info!("Volume {} already fully uploaded", volume);
+                            if !self.keep_volumes {
+                                let _ = std::fs::remove_file(&vol.path);
+                            }
+                            if let Some(vol_mut) = self.volumes.get_mut(&volume) {
+                                vol_mut.status = VolumeStatus::Uploaded;
+                            }
+                            return Ok(());
+                        } else if remote_size > 0 && remote_size < vol.size {
+                            info!("Partial upload found for volume {} ({} of {} bytes)", 
+                                  volume, remote_size, vol.size);
+                            // Supprimer le fichier partiel et recommencer
+                            let _ = storage.delete_file(&remote_path);
+                        }
+                    }
+                    
+                    // Upload complet
+                    match self.upload_volume_with_retry(volume) {
+                        Ok(_) => {
+                            if !self.keep_volumes {
+                                let _ = std::fs::remove_file(&vol.path);
+                            }
+                            if let Some(vol_mut) = self.volumes.get_mut(&volume) {
+                                vol_mut.status = VolumeStatus::Uploaded;
+                            }
+                            info!("Volume {} successfully uploaded", volume);
+                        }
+                        Err(e) => {
+                            error!("Failed to upload volume {}: {}", volume, e);
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_volume_integrity(&self, volume_path: &Path, expected_size: u64) -> Result<bool> {
+        if !volume_path.exists() {
+            return Ok(false);
+        }
+        
+        let metadata = std::fs::metadata(volume_path)?;
+        if metadata.len() != expected_size {
+            warn!("Volume size mismatch: expected {} but got {}", expected_size, metadata.len());
+            return Ok(false);
+        }
+        
+        // Vérifier le header magique si présent
+        let mut file = std::fs::File::open(volume_path)?;
+        let mut magic = [0u8; 8];
+        use std::io::Read;
+        if file.read_exact(&mut magic).is_ok() {
+            if &magic == MAGIC_BYTES {
+                debug!("Volume has valid magic bytes");
+            } else {
+                warn!("Volume has invalid magic bytes");
+                return Ok(false);
+            }
+        }
+        
+        Ok(true)
+    }
+
+    pub fn verify_all_volumes(&mut self) -> Result<Vec<u64>> {
+        let mut corrupted_volumes = Vec::new();
+        let volumes_to_check: Vec<(u64, VolumeInfo)> = self.volumes
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        
+        for (number, vol) in volumes_to_check {
+            if vol.status == VolumeStatus::Closed || vol.status == VolumeStatus::Active {
+                if !self.verify_volume_integrity(&vol.path, vol.size)? {
+                    error!("Volume {} is corrupted", number);
+                    corrupted_volumes.push(number);
+                    
+                    if let Some(vol_mut) = self.volumes.get_mut(&number) {
+                        vol_mut.status = VolumeStatus::Corrupted;
+                    }
+                }
+            }
+        }
+        
+        Ok(corrupted_volumes)
+    }
+
     fn upload_volume_with_retry(&self, volume: u64) -> Result<()> {
         if let Some(storage) = &self.remote_storage {
             if let Some(vol) = self.volumes.get(&volume) {
@@ -293,12 +406,56 @@ impl VolumeManager {
                     
                     storage.create_dir(remote_dir)?;
                     
-                    upload_with_retry(storage.as_ref(), &vol.path, &remote_path, 3, 60)
-                        .map_err(|e| TemsError::Remote(e.to_string()))?;
+                    // Utiliser la fonction d'upload avec timeout
+                    use std::time::Instant;
+                    
+                    let start = Instant::now();
+                    let timeout = std::time::Duration::from_secs(3600); // 1 heure max
+                    
+                    let result = upload_with_retry(
+                        storage.as_ref(), 
+                        &vol.path, 
+                        &remote_path, 
+                        3, 
+                        60
+                    );
+                    
+                    match result {
+                        Ok(_) => {
+                            let elapsed = start.elapsed();
+                            info!("Volume {} uploaded in {:.2} seconds", volume, elapsed.as_secs_f64());
+                            
+                            // Vérifier la taille après upload
+                            if let Ok(remote_size) = storage.get_size(&remote_path) {
+                                if remote_size != vol.size {
+                                    let err: TemsError = anyhow::anyhow!(
+                                        "Upload verification failed: size mismatch (remote: {}, local: {})",
+                                        remote_size, vol.size
+                                    ).into();
+                                    return Err(err.into());
+                                }
+                            }
+                            
+                            Ok(())
+                        }
+                        Err(e) => {
+                            if start.elapsed() > timeout {
+                                error!("Upload timeout for volume {} after {} seconds", volume, timeout.as_secs());
+                                let err: TemsError = anyhow::anyhow!("Upload timeout after {} seconds", timeout.as_secs()).into();
+                                return Err(err.into());
+                            }
+                            Err(e.into())
+                        }
+                    }
+                } else {
+                    Ok(())
                 }
+            } else {
+                Ok(())
             }
+        } else {
+            Ok(())
         }
-        Ok(())
     }
 
     fn get_default_volume_size(&self) -> Result<u64> {

@@ -370,24 +370,70 @@ fn execute_remote(
     storage.create_dir(Path::new("volumes"))?;
     println!("📁 Remote directories ready");
 
-    let temp_dir = config.remote.temp_dir.clone().unwrap_or_else(|| std::env::temp_dir()).join(format!("tems-backup-{}", std::process::id()));
+    let temp_dir = config.remote.temp_dir.clone()
+        .unwrap_or_else(|| std::env::temp_dir())
+        .join(format!("tems-backup-{}", std::process::id()));
+    
+    // Nettoyer si le dossier existe déjà (processus précédent crashé)
+    if temp_dir.exists() {
+        println!("🧹 Nettoyage du dossier temporaire existant...");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+    
     std::fs::create_dir_all(&temp_dir)?;
 
     println!("📁 Local temporary directory: {}", temp_dir.display());
     println!("   Do NOT interrupt the process during uploads!\n");
 
     let db_path = temp_dir.join("archive.db");
+    let db_exists = storage.exists(Path::new("archive.db"))?;
+
+    if db_exists {
+        println!("Found existing remote database, downloading...");
+        let max_retries = 3;
+        for attempt in 1..=max_retries {
+            match storage.download_file(Path::new("archive.db"), &db_path) {
+                Ok(_) => break,
+                Err(e) => {
+                    if attempt == max_retries {
+                        return Err(anyhow::anyhow!("Failed to download database after {} attempts: {}", max_retries, e));
+                    }
+                    println!("⚠️  Download failed (attempt {}/{}), retrying in 5s...", attempt, max_retries);
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                }
+            }
+        }
+    } else {
+        println!("No existing remote database found, creating new one");
+    }
+
     let db = Database::open(&db_path)?;
 
-    let archive_config = ArchiveConfig {
-        chunk_size,
-        compression,
-        compression_level: compress_level,
-        hash_algorithm: hash_algo,
-        created_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64,
-        version: 1,
-    };
-    db.save_config(&archive_config)?;
+    // Sauvegarder la configuration seulement si c'est une nouvelle archive
+    if !db_exists {
+        let archive_config = ArchiveConfig {
+            chunk_size,
+            compression,
+            compression_level: compress_level,
+            hash_algorithm: hash_algo,
+            created_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64,
+            version: 1,
+        };
+        db.save_config(&archive_config)?;
+    } else {
+        // Vérifier que la configuration existante est compatible
+        let existing_config = db.load_config()?
+            .ok_or_else(|| anyhow::anyhow!("Remote archive has no configuration"))?;
+        
+        if existing_config.chunk_size != chunk_size {
+            println!("⚠️  Warning: Using existing chunk size {} instead of requested {}", 
+                existing_config.chunk_size, chunk_size);
+        }
+        if existing_config.compression != compression {
+            println!("⚠️  Warning: Using existing compression {} instead of requested {}", 
+                existing_config.compression, compression);
+        }
+    }
 
     let chunker = Chunker::new(
         chunk_size,
@@ -435,9 +481,31 @@ fn execute_remote(
     println!("\n📤 Uploading final volume...");
     archive.upload_final_volume()?;
 
-    println!("📤 Uploading database...");
-    storage.upload_file(&db_path, Path::new("archive.db"))?;
+    println!("📤 Uploading updated database...");
+    
+    // Upload avec retry
+    let max_retries = 3;
+    for attempt in 1..=max_retries {
+        match storage.upload_file(&db_path, Path::new("archive.db")) {
+            Ok(_) => break,
+            Err(e) => {
+                if attempt == max_retries {
+                    return Err(anyhow::anyhow!("Failed to upload database after {} attempts: {}", max_retries, e));
+                }
+                println!("⚠️  Upload failed (attempt {}/{}), retrying in 5s...", attempt, max_retries);
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
+        }
+    }
+    
     println!("✅ Database uploaded successfully");
+
+    // Vérifier que la DB est bien présente
+    if storage.exists(Path::new("archive.db"))? {
+        println!("✅ Database verified on remote");
+    } else {
+        println!("⚠️  Warning: Database not found on remote after upload");
+    }
 
     println!("\n🔍 Verifying remote files...");
     match storage.list_files(Path::new("volumes")) {
@@ -445,9 +513,28 @@ fn execute_remote(
         Err(e) => eprintln!("   Could not list remote volumes: {}", e),
     }
 
+    // Nettoyage amélioré
     if !keep_volumes {
-        let _ = std::fs::remove_dir_all(temp_dir);
-        println!("🧹 Local temporary directory cleaned");
+        println!("🧹 Cleaning temporary directory...");
+        
+        // Essayer plusieurs fois de supprimer (parfois les fichiers sont encore utilisés)
+        for attempt in 1..=3 {
+            match std::fs::remove_dir_all(&temp_dir) {
+                Ok(_) => {
+                    println!("🧹 Local temporary directory cleaned");
+                    break;
+                }
+                Err(e) => {
+                    if attempt == 3 {
+                        println!("⚠️  Could not clean temp dir (will be cleaned on next run): {}", e);
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                }
+            }
+        }
+    } else {
+        println!("📁 Keeping temporary files in: {}", temp_dir.display());
     }
 
     let stats = archive.get_stats()?;

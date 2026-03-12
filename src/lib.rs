@@ -53,7 +53,8 @@ pub mod core;
 pub mod storage;
 pub mod utils;
 pub mod error;
-pub mod remote;  // ← AJOUTER CETTE LIGNE
+pub mod remote;
+pub mod constants;  // ← Nouveau module
 
 /// Current version of tems-backup
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -81,9 +82,6 @@ pub const VOLUME_EXTENSION: &str = "tms";
 
 /// Database file extension
 pub const DATABASE_EXTENSION: &str = "db";
-
-/// Magic bytes for archive identification
-pub const MAGIC_BYTES: &[u8; 8] = b"TEMSBKUP";
 
 /// Current archive format version
 pub const ARCHIVE_VERSION: u32 = 1;
@@ -143,7 +141,7 @@ mod tests {
     fn test_constants() {
         assert!(DEFAULT_CHUNK_SIZE >= 1024);
         assert!(MAX_CHUNK_SIZE > DEFAULT_CHUNK_SIZE);
-        assert_eq!(MAGIC_BYTES.len(), 8);
+        assert_eq!(constants::MAGIC_BYTES.len(), 8);
         assert_eq!(ARCHIVE_VERSION, 1);
     }
 
@@ -204,7 +202,7 @@ pub mod prelude {
     pub use crate::storage::database::Database;
     pub use crate::storage::volume::{VolumeManager, VolumeInfo, VolumeStatus};
     pub use crate::error::{TemsError, Result};
-    pub use crate::{VERSION, AUTHOR, WEBSITE, YEAR};
+    pub use crate::{VERSION, AUTHOR, WEBSITE, YEAR, ARCHIVE_VERSION};
 }
 
 /// Version requirements for interoperability

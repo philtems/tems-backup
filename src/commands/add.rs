@@ -9,13 +9,11 @@ use crate::storage::database::Database;
 use crate::core::file_scanner::FileScanner;
 use crate::core::chunk::Chunker;
 use crate::commands::create::{parse_size, format_size};
-use crate::core::compression::CompressionAlgorithm;
 use crate::utils::progress::ProgressBar;
 use crate::utils::parse_duration;
 use crate::utils::retry::RetryConfig;
 use crate::core::archive::ProcessResult;
 use crate::remote::{self, RemoteLocation, AuthInfo};
-use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::SystemTime;
@@ -366,18 +364,42 @@ fn execute_remote_add(
     storage.create_dir(Path::new("volumes"))?;
     println!("📁 Remote directories ready");
 
-    let temp_dir = config.remote.temp_dir.clone().unwrap_or_else(|| std::env::temp_dir()).join(format!("tems-backup-{}", std::process::id()));
+    let temp_dir = config.remote.temp_dir.clone()
+        .unwrap_or_else(|| std::env::temp_dir())
+        .join(format!("tems-backup-{}", std::process::id()));
+    
+    if temp_dir.exists() {
+        println!("🧹 Nettoyage du dossier temporaire existant...");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+    
     std::fs::create_dir_all(&temp_dir)?;
 
     println!("📁 Local temporary directory: {}", temp_dir.display());
     println!("   Do NOT interrupt the process during uploads!\n");
 
     let db_path = temp_dir.join("archive.db");
+    
+    // Vérifier si la DB distante existe (elle DOIT exister pour un add)
     if !storage.exists(Path::new("archive.db"))? {
-        return Err(anyhow::anyhow!("Remote archive not found"));
+        return Err(anyhow::anyhow!("Remote archive not found. Use 'create' command first."));
     }
+    
     println!("Downloading database...");
-    storage.download_file(Path::new("archive.db"), &db_path)?;
+    
+    let max_retries = 3;
+    for attempt in 1..=max_retries {
+        match storage.download_file(Path::new("archive.db"), &db_path) {
+            Ok(_) => break,
+            Err(e) => {
+                if attempt == max_retries {
+                    return Err(anyhow::anyhow!("Failed to download database after {} attempts: {}", max_retries, e));
+                }
+                println!("⚠️  Download failed (attempt {}/{}), retrying in 5s...", attempt, max_retries);
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
+        }
+    }
 
     let db = Database::open(&db_path)?;
     
@@ -458,7 +480,20 @@ fn execute_remote_add(
     archive.upload_final_volume()?;
 
     println!("📤 Uploading updated database...");
-    storage.upload_file(&db_path, Path::new("archive.db"))?;
+    
+    let max_retries = 3;
+    for attempt in 1..=max_retries {
+        match storage.upload_file(&db_path, Path::new("archive.db")) {
+            Ok(_) => break,
+            Err(e) => {
+                if attempt == max_retries {
+                    return Err(anyhow::anyhow!("Failed to upload database after {} attempts: {}", max_retries, e));
+                }
+                println!("⚠️  Upload failed (attempt {}/{}), retrying in 5s...", attempt, max_retries);
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
+        }
+    }
     println!("✅ Database uploaded successfully");
 
     println!("\n🔍 Verifying remote files...");
@@ -468,8 +503,21 @@ fn execute_remote_add(
     }
 
     if !keep_volumes {
-        let _ = std::fs::remove_dir_all(temp_dir);
-        println!("🧹 Local temporary directory cleaned");
+        for attempt in 1..=3 {
+            match std::fs::remove_dir_all(&temp_dir) {
+                Ok(_) => {
+                    println!("🧹 Local temporary directory cleaned");
+                    break;
+                }
+                Err(e) => {
+                    if attempt == 3 {
+                        println!("⚠️  Could not clean temp dir (will be cleaned on next run): {}", e);
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                }
+            }
+        }
     }
 
     println!("\n✅ Remote addition completed successfully!");

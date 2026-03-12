@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use ssh2::Session;
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use std::net::ToSocketAddrs;
 
 use crate::remote::{RemoteStorage, RemoteLocation, AuthInfo};
 
@@ -18,11 +20,28 @@ pub struct SftpStorage {
 impl SftpStorage {
     pub fn new(location: RemoteLocation, auth: AuthInfo, _temp_dir: PathBuf) -> Result<Self> {
         let port = location.port.unwrap_or(22);
-        let addr = format!("{}:{}", location.host, port);
         
-        let tcp = TcpStream::connect(addr)?;
+        // Résoudre le hostname en adresse IP
+        let addr_str = format!("{}:{}", location.host, port);
+        let socket_addrs: Vec<std::net::SocketAddr> = addr_str.to_socket_addrs()?
+            .collect();
+
+        if socket_addrs.is_empty() {
+            return Err(anyhow!("Could not resolve hostname: {}", location.host));
+        }
+
+        // Prendre la première adresse résolue (généralement IPv4)
+        let socket_addr = socket_addrs[0];
+        
+        // Timeout de connexion : 30 secondes
+        let tcp = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(30))?;
+        
+        tcp.set_read_timeout(Some(Duration::from_secs(60)))?;
+        tcp.set_write_timeout(Some(Duration::from_secs(60)))?;
+        
         let mut session = Session::new()?;
         session.set_tcp_stream(tcp);
+        session.set_timeout(60000); // Timeout global en millisecondes
         session.handshake()?;
         
         if let Some(key_file) = &auth.key_file {

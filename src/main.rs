@@ -11,7 +11,7 @@ mod core;
 mod storage;
 mod utils;
 mod error;
-mod remote;  // ← Nouveau module
+mod remote;
 
 use commands::*;
 use utils::config::Config;
@@ -19,7 +19,7 @@ use utils::config::Config;
 #[derive(Parser)]
 #[command(name = "tems-backup")]
 #[command(author = "Philippe TEMESI <philippe@tems.be>")]
-#[command(version = "0.2.0")]  // ← Nouvelle version
+#[command(version = "0.2.0")]
 #[command(about = "Advanced backup tool with deduplication and versioning", long_about = None)]
 struct Cli {
     /// Verbose mode (-v, -vv, -vvv)
@@ -77,6 +77,9 @@ fn main() -> Result<()> {
     // Initialize logging based on verbosity
     utils::logging::init(cli.verbose)?;
 
+    // Nettoyer les dossiers temporaires orphelins au démarrage
+    cleanup_orphaned_temp_dirs()?;
+
     // Load configuration
     let config = Config::load(cli.config)?;
 
@@ -91,6 +94,63 @@ fn main() -> Result<()> {
         Commands::Gc(args) => gc::execute(args, &config),
         Commands::Check(args) => check::execute(args, &config),
         Commands::Volume(args) => volume::execute(args, &config),
+    }
+}
+
+fn cleanup_orphaned_temp_dirs() -> Result<()> {
+    let temp_base = std::env::temp_dir();
+    let pattern = "tems-backup-";
+    
+    if !temp_base.exists() {
+        return Ok(());
+    }
+    
+    for entry in std::fs::read_dir(temp_base)? {
+        let entry = entry?;
+        let path = entry.path();
+        
+        if path.is_dir() {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with(pattern) {
+                    // Vérifier si le processus est toujours en vie
+                    if let Some(pid_str) = name.strip_prefix(pattern) {
+                        if let Ok(pid) = pid_str.parse::<u32>() {
+                            if !is_process_running(pid) {
+                                println!("🧹 Nettoyage du dossier temporaire orphelin: {}", path.display());
+                                let _ = std::fs::remove_dir_all(&path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+#[cfg(unix)]
+fn is_process_running(pid: u32) -> bool {
+    use sysinfo::{System, Pid};
+    let system = System::new();
+    system.process(Pid::from_u32(pid)).is_some()
+}
+
+
+#[cfg(windows)]
+fn is_process_running(pid: u32) -> bool {
+    use winapi::um::processthreadsapi::OpenProcess;
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::winnt::PROCESS_QUERY_INFORMATION;
+    
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid);
+        if handle.is_null() {
+            false
+        } else {
+            CloseHandle(handle);
+            true
+        }
     }
 }
 
